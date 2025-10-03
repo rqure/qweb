@@ -11,6 +11,7 @@ use store_service::{StoreHandle, StoreService};
 
 pub struct AppState {
     store_handle: StoreHandle,
+    jwt_secret: String,
 }
 
 #[actix_web::main]
@@ -18,7 +19,7 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
     let store_address = std::env::var("QCORE_ADDRESS")
-        .unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+        .unwrap_or_else(|_| "127.0.0.1:9100".to_string());
     
     info!("Starting qweb server");
     info!("Connecting to qcore-rs at: {}", store_address);
@@ -37,6 +38,11 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| "default_secret".to_string());
+
+    info!("JWT secret configured");
+
     // Create StoreService and get handle
     let (store_handle, store_service) = StoreService::new(store_proxy);
 
@@ -45,7 +51,7 @@ async fn main() -> std::io::Result<()> {
         store_service.run().await;
     });
 
-    let app_state = web::Data::new(AppState { store_handle });
+    let app_state = web::Data::new(AppState { store_handle, jwt_secret });
 
     let bind_address = std::env::var("BIND_ADDRESS")
         .unwrap_or_else(|_| "0.0.0.0:3000".to_string());
@@ -55,6 +61,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
+            .route("/api/login", web::post().to(handlers::login))
             .route("/api/read", web::post().to(handlers::read))
             .route("/api/write", web::post().to(handlers::write))
             .route("/api/create", web::post().to(handlers::create))

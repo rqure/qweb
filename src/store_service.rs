@@ -1,6 +1,7 @@
 use qlib_rs::{
     AdjustBehavior, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, PageOpts,
     PageResult, PushCondition, Result, Single, StoreProxy, Timestamp, Value,
+    auth::{authenticate_user, get_scope, AuthorizationScope}, AuthConfig, Cache, CelExecutor,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -80,6 +81,17 @@ pub enum StoreCommand {
         entity_type: EntityType,
         filter: Option<String>,
         respond_to: oneshot::Sender<Result<Vec<EntityId>>>,
+    },
+    AuthenticateUser {
+        name: String,
+        password: String,
+        respond_to: oneshot::Sender<Result<EntityId>>,
+    },
+    GetScope {
+        subject_id: EntityId,
+        resource_id: EntityId,
+        field: FieldType,
+        respond_to: oneshot::Sender<Result<AuthorizationScope>>,
     },
 }
 
@@ -325,12 +337,102 @@ impl StoreHandle {
         rx.await
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
     }
+
+    pub async fn authenticate_user(&self, name: &str, password: &str) -> Result<EntityId> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::AuthenticateUser {
+                name: name.to_string(),
+                password: password.to_string(),
+                respond_to: tx,
+            })
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
+    }
+
+    pub async fn get_scope(&self, subject_id: EntityId, resource_id: EntityId, field: FieldType) -> Result<AuthorizationScope> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::GetScope {
+                subject_id,
+                resource_id,
+                field,
+                respond_to: tx,
+            })
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
+    }
+}
+
+/// Create permission cache
+fn create_permission_cache(store: &StoreProxy) -> Option<qlib_rs::Cache> {
+    // Get values needed for cache creation
+    let permission_entity_type = match store.get_entity_type("Permission") {
+        Ok(et) => et,
+        Err(e) => {
+            log::debug!("Failed to get permission entity type: {}", e);
+            return None;
+        }
+    };
+    
+    let resource_type_field = match store.get_field_type("ResourceType") {
+        Ok(ft) => ft,
+        Err(e) => {
+            log::debug!("Failed to get resource type field: {}", e);
+            return None;
+        }
+    };
+    
+    let resource_field_field = match store.get_field_type("ResourceField") {
+        Ok(ft) => ft,
+        Err(e) => {
+            log::debug!("Failed to get resource field field: {}", e);
+            return None;
+        }
+    };
+    
+    let scope_field = match store.get_field_type("Scope") {
+        Ok(ft) => ft,
+        Err(e) => {
+            log::debug!("Failed to get scope field: {}", e);
+            return None;
+        }
+    };
+    
+    let condition_field = match store.get_field_type("Condition") {
+        Ok(ft) => ft,
+        Err(e) => {
+            log::debug!("Failed to get condition field: {}", e);
+            return None;
+        }
+    };
+    
+    match qlib_rs::Cache::new(
+        store,
+        permission_entity_type,
+        vec![resource_type_field, resource_field_field],
+        vec![scope_field, condition_field]
+    ) {
+        Ok((cache, _notification_queue)) => {
+            log::debug!("Successfully created permission cache");
+            Some(cache)
+        }
+        Err(e) => {
+            log::debug!("Failed to create permission cache: {}", e);
+            None
+        }
+    }
 }
 
 /// Service that wraps StoreProxy and runs in its own task
 pub struct StoreService {
     proxy: StoreProxy,
     receiver: mpsc::UnboundedReceiver<StoreCommand>,
+    auth_config: qlib_rs::AuthConfig,
+    permission_cache: Option<qlib_rs::Cache>,
+    cel_executor: qlib_rs::CelExecutor,
 }
 
 impl StoreService {
@@ -338,7 +440,10 @@ impl StoreService {
     pub fn new(proxy: StoreProxy) -> (StoreHandle, Self) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let handle = StoreHandle { sender };
-        let service = StoreService { proxy, receiver };
+        let auth_config = qlib_rs::AuthConfig::default();
+        let permission_cache = create_permission_cache(&proxy);
+        let cel_executor = qlib_rs::CelExecutor::new();
+        let service = StoreService { proxy, receiver, auth_config, permission_cache, cel_executor };
         (handle, service)
     }
 
@@ -476,6 +581,18 @@ impl StoreService {
             } => {
                 let result = self.proxy.find_entities(entity_type, filter.as_deref());
                 let _ = respond_to.send(result);
+            }
+            StoreCommand::AuthenticateUser { name, password, respond_to } => {
+                let result = qlib_rs::auth::authenticate_user(&self.proxy, &name, &password, &self.auth_config);
+                let _ = respond_to.send(result);
+            }
+            StoreCommand::GetScope { subject_id, resource_id, field, respond_to } => {
+                if let Some(cache) = &self.permission_cache {
+                    let result = qlib_rs::auth::get_scope(&self.proxy, &mut self.cel_executor, cache, subject_id, resource_id, field);
+                    let _ = respond_to.send(result);
+                } else {
+                    let _ = respond_to.send(Err(qlib_rs::Error::StoreProxyError("Permission cache not available".to_string())));
+                }
             }
         }
     }

@@ -33,6 +33,17 @@ pub struct FindRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoginResponse {
+    pub token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SchemaRequest {
     pub entity_type: String,
 }
