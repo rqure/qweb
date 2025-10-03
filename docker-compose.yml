@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  qweb:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - QCORE_ADDRESS=qcore:8080
+      - BIND_ADDRESS=0.0.0.0:3000
+      - RUST_LOG=info
+    depends_on:
+      - qcore
+    restart: unless-stopped
+
+  # Placeholder for qcore-rs service
+  # Replace with actual qcore-rs configuration
+  qcore:
+    image: rqure/qcore-rs:latest
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
