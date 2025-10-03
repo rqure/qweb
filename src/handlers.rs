@@ -1,5 +1,5 @@
 use actix_web::{web, HttpResponse, Responder};
-use qlib_rs::data::{EntityId, PageOpts};
+use qlib_rs::{EntityId, PageOpts};
 
 use crate::models::{
     ApiResponse, CreateRequest, DeleteRequest, FindRequest, ReadRequest,
@@ -8,7 +8,7 @@ use crate::models::{
 use crate::AppState;
 
 pub async fn read(state: web::Data<AppState>, req: web::Json<ReadRequest>) -> impl Responder {
-    let proxy = state.store_proxy.read().await;
+    let handle = &state.store_handle;
 
     let entity_id = match req.entity_id.parse::<u64>() {
         Ok(id) => EntityId(id),
@@ -20,7 +20,7 @@ pub async fn read(state: web::Data<AppState>, req: web::Json<ReadRequest>) -> im
 
     let mut field_types = Vec::new();
     for field_name in &req.fields {
-        match proxy.get_field_type(field_name).await {
+        match handle.get_field_type(field_name).await {
             Ok(ft) => field_types.push(ft),
             Err(e) => {
                 return HttpResponse::BadRequest().json(ApiResponse::<()>::error(
@@ -30,7 +30,7 @@ pub async fn read(state: web::Data<AppState>, req: web::Json<ReadRequest>) -> im
         }
     }
 
-    match proxy.read(entity_id, &field_types).await {
+    match handle.read(entity_id, &field_types).await {
         Ok((value, timestamp, writer_id)) => {
             let result: serde_json::Value = serde_json::json!({
                 "entity_id": req.entity_id,
@@ -47,7 +47,7 @@ pub async fn read(state: web::Data<AppState>, req: web::Json<ReadRequest>) -> im
 }
 
 pub async fn write(state: web::Data<AppState>, req: web::Json<WriteRequest>) -> impl Responder {
-    let proxy = state.store_proxy.read().await;
+    let handle = &state.store_handle;
 
     let entity_id = match req.entity_id.parse::<u64>() {
         Ok(id) => EntityId(id),
@@ -57,7 +57,7 @@ pub async fn write(state: web::Data<AppState>, req: web::Json<WriteRequest>) -> 
         }
     };
 
-    let field_type = match proxy.get_field_type(&req.field).await {
+    let field_type = match handle.get_field_type(&req.field).await {
         Ok(ft) => ft,
         Err(e) => {
             return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
@@ -75,7 +75,7 @@ pub async fn write(state: web::Data<AppState>, req: web::Json<WriteRequest>) -> 
         }
     };
 
-    match proxy.write(entity_id, &[field_type], value, None, None, None, None).await {
+    match handle.write(entity_id, &[field_type], value, None, None, None, None).await {
         Ok(_) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
             "message": "Successfully wrote value"
         }))),
@@ -85,9 +85,9 @@ pub async fn write(state: web::Data<AppState>, req: web::Json<WriteRequest>) -> 
 }
 
 pub async fn create(state: web::Data<AppState>, req: web::Json<CreateRequest>) -> impl Responder {
-    let proxy = state.store_proxy.read().await;
+    let handle = &state.store_handle;
 
-    let entity_type = match proxy.get_entity_type(&req.entity_type).await {
+    let entity_type = match handle.get_entity_type(&req.entity_type).await {
         Ok(et) => et,
         Err(e) => {
             return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
@@ -97,7 +97,7 @@ pub async fn create(state: web::Data<AppState>, req: web::Json<CreateRequest>) -
         }
     };
 
-    match proxy.create_entity(entity_type, None, &req.name).await {
+    match handle.create_entity(entity_type, None, &req.name).await {
         Ok(entity_id) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
             "entity_id": entity_id.0.to_string(),
             "entity_type": req.entity_type,
@@ -109,7 +109,7 @@ pub async fn create(state: web::Data<AppState>, req: web::Json<CreateRequest>) -
 }
 
 pub async fn delete(state: web::Data<AppState>, req: web::Json<DeleteRequest>) -> impl Responder {
-    let proxy = state.store_proxy.read().await;
+    let handle = &state.store_handle;
 
     let entity_id = match req.entity_id.parse::<u64>() {
         Ok(id) => EntityId(id),
@@ -119,7 +119,7 @@ pub async fn delete(state: web::Data<AppState>, req: web::Json<DeleteRequest>) -
         }
     };
 
-    match proxy.delete_entity(entity_id).await {
+    match handle.delete_entity(entity_id).await {
         Ok(_) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
             "message": "Successfully deleted entity"
         }))),
@@ -129,9 +129,9 @@ pub async fn delete(state: web::Data<AppState>, req: web::Json<DeleteRequest>) -
 }
 
 pub async fn find(state: web::Data<AppState>, req: web::Json<FindRequest>) -> impl Responder {
-    let proxy = state.store_proxy.read().await;
+    let handle = &state.store_handle;
 
-    let entity_type = match proxy.get_entity_type(&req.entity_type).await {
+    let entity_type = match handle.get_entity_type(&req.entity_type).await {
         Ok(et) => et,
         Err(e) => {
             return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
@@ -150,7 +150,7 @@ pub async fn find(state: web::Data<AppState>, req: web::Json<FindRequest>) -> im
         None
     };
 
-    match proxy.find_entities_paginated(entity_type, page_opts.as_ref(), req.filter.as_deref()).await {
+    match handle.find_entities_paginated(entity_type, page_opts.as_ref(), req.filter.as_deref()).await {
         Ok(result) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
             "entities": result.items.iter().map(|id| id.0.to_string()).collect::<Vec<_>>(),
             "total": result.total,
@@ -162,9 +162,9 @@ pub async fn find(state: web::Data<AppState>, req: web::Json<FindRequest>) -> im
 }
 
 pub async fn schema(state: web::Data<AppState>, req: web::Json<SchemaRequest>) -> impl Responder {
-    let proxy = state.store_proxy.read().await;
+    let handle = &state.store_handle;
 
-    let entity_type = match proxy.get_entity_type(&req.entity_type).await {
+    let entity_type = match handle.get_entity_type(&req.entity_type).await {
         Ok(et) => et,
         Err(e) => {
             return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
@@ -174,7 +174,7 @@ pub async fn schema(state: web::Data<AppState>, req: web::Json<SchemaRequest>) -
         }
     };
 
-    match proxy.get_entity_schema(entity_type).await {
+    match handle.get_entity_schema(entity_type).await {
         Ok(schema) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
             "entity_type": req.entity_type,
             "schema": format!("{:?}", schema)

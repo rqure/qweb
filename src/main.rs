@@ -1,15 +1,16 @@
 use actix_web::{web, App, HttpServer};
 use log::{error, info};
-use qlib_rs::data::AsyncStoreProxy;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use qlib_rs::StoreProxy;
 
 mod handlers;
 mod models;
+mod store_service;
 mod websocket;
 
+use store_service::{StoreHandle, StoreService};
+
 pub struct AppState {
-    store_proxy: Arc<RwLock<AsyncStoreProxy>>,
+    store_handle: StoreHandle,
 }
 
 #[actix_web::main]
@@ -22,8 +23,8 @@ async fn main() -> std::io::Result<()> {
     info!("Starting qweb server");
     info!("Connecting to qcore-rs at: {}", store_address);
 
-    // Connect to qcore-rs on startup
-    let store_proxy = match AsyncStoreProxy::connect(&store_address).await {
+    // Connect to qcore-rs on startup using non-async StoreProxy
+    let store_proxy = match StoreProxy::connect(&store_address) {
         Ok(proxy) => {
             info!("Successfully connected to qcore-rs");
             proxy
@@ -36,9 +37,15 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    let app_state = web::Data::new(AppState {
-        store_proxy: Arc::new(RwLock::new(store_proxy)),
+    // Create StoreService and get handle
+    let (store_handle, store_service) = StoreService::new(store_proxy);
+
+    // Spawn the StoreService in a separate task
+    tokio::spawn(async move {
+        store_service.run().await;
     });
+
+    let app_state = web::Data::new(AppState { store_handle });
 
     let bind_address = std::env::var("BIND_ADDRESS")
         .unwrap_or_else(|_| "0.0.0.0:3000".to_string());
