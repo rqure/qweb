@@ -1515,6 +1515,7 @@ dependencies = [
  "actix-web",
  "actix-ws",
  "chrono",
+ "crossbeam",
  "env_logger",
  "futures-util",
  "jsonwebtoken",

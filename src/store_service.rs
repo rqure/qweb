@@ -1,9 +1,10 @@
 use qlib_rs::{
     AdjustBehavior, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, PageOpts,
     PageResult, PushCondition, Result, Single, StoreProxy, Timestamp, Value,
-    auth::AuthorizationScope,
+    auth::AuthorizationScope, Notification, NotifyConfig,
 };
 use tokio::sync::{mpsc, oneshot};
+use crossbeam::channel::Sender;
 
 /// Commands that can be sent to the StoreService
 pub enum StoreCommand {
@@ -92,6 +93,16 @@ pub enum StoreCommand {
         resource_id: EntityId,
         field: FieldType,
         respond_to: oneshot::Sender<Result<AuthorizationScope>>,
+    },
+    RegisterNotification {
+        config: NotifyConfig,
+        sender: Sender<Notification>,
+        respond_to: oneshot::Sender<Result<()>>,
+    },
+    UnregisterNotification {
+        config: NotifyConfig,
+        sender: Sender<Notification>,
+        respond_to: oneshot::Sender<Result<()>>,
     },
 }
 
@@ -364,6 +375,32 @@ impl StoreHandle {
         rx.await
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
     }
+
+    pub async fn register_notification(&self, config: NotifyConfig, sender: Sender<Notification>) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::RegisterNotification {
+                config,
+                sender,
+                respond_to: tx,
+            })
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
+    }
+
+    pub async fn unregister_notification(&self, config: NotifyConfig, sender: Sender<Notification>) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::UnregisterNotification {
+                config,
+                sender,
+                respond_to: tx,
+            })
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
+    }
 }
 
 /// Create permission cache
@@ -448,9 +485,13 @@ impl StoreService {
     }
 
     /// Run the service, processing commands until the channel is closed
-    pub async fn run(mut self) {
+    pub async fn run(&mut self) {
         while let Some(command) = self.receiver.recv().await {
             self.handle_command(command);
+            // Process any pending notifications
+            if let Err(e) = self.proxy.process_notifications() {
+                log::warn!("Failed to process notifications: {:?}", e);
+            }
         }
     }
 
@@ -593,6 +634,14 @@ impl StoreService {
                 } else {
                     let _ = respond_to.send(Err(qlib_rs::Error::StoreProxyError("Permission cache not available".to_string())));
                 }
+            }
+            StoreCommand::RegisterNotification { config, sender, respond_to } => {
+                let result = self.proxy.register_notification(config, sender);
+                let _ = respond_to.send(result);
+            }
+            StoreCommand::UnregisterNotification { config, sender, respond_to } => {
+                self.proxy.unregister_notification(&config, &sender);
+                let _ = respond_to.send(Ok(()));
             }
         }
     }

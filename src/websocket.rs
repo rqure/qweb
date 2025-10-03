@@ -3,9 +3,21 @@ use actix_ws::Message;
 use futures_util::StreamExt;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+use crossbeam::channel;
 
 use crate::store_service::StoreHandle;
 use crate::AppState;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotifyConfigJson {
+    pub entity_id: Option<String>, // For EntityId variant
+    pub entity_type: Option<String>, // For EntityType variant
+    pub field: String,
+    pub trigger_on_change: bool,
+    pub context: Vec<Vec<String>>, // Context fields as field names
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -15,6 +27,8 @@ enum WsRequest {
     Create { entity_type: String, name: String },
     Delete { entity_id: String },
     Find { entity_type: String, filter: Option<String> },
+    RegisterNotification { config: NotifyConfigJson },
+    UnregisterNotification { config: NotifyConfigJson },
     Ping,
 }
 
@@ -54,37 +68,85 @@ pub async fn ws_handler(
 
     let handle = state.store_handle.clone();
 
-    actix_web::rt::spawn(async move {
-        while let Some(Ok(msg)) = msg_stream.next().await {
-            match msg {
-                Message::Text(text) => {
-                    let response = match serde_json::from_str::<WsRequest>(&text) {
-                        Ok(request) => handle_ws_request(request, &handle).await,
-                        Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
-                    };
+        // Create channels for notifications
+    let (crossbeam_sender, crossbeam_receiver) = channel::unbounded::<qlib_rs::Notification>();
+    let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<qlib_rs::Notification>();
 
-                    let response_json = serde_json::to_string(&response).unwrap();
-                    if let Err(e) = session.text(response_json).await {
-                        error!("Failed to send WebSocket response: {}", e);
-                        break;
-                    }
-                }
-                Message::Ping(bytes) => {
-                    if let Err(e) = session.pong(&bytes).await {
-                        error!("Failed to send pong: {}", e);
-                        break;
-                    }
-                }
-                Message::Close(_) => {
-                    info!("WebSocket connection closed by client");
-                    break;
-                }
-                _ => {}
+    // Track registered configs
+    let mut registered_configs: HashMap<qlib_rs::NotifyConfig, ()> = HashMap::new();
+
+    // Spawn task to forward notifications to WebSocket
+    let mut session_clone = session.clone();
+    tokio::spawn(async move {
+        while let Some(notification) = tokio_receiver.recv().await {
+            let notification_json = serde_json::to_string(&WsResponse::success(serde_json::json!({
+                "type": "notification",
+                "notification": notification
+            }))).unwrap();
+            if let Err(e) = session_clone.text(notification_json).await {
+                error!("Failed to send notification: {}", e);
+                break;
             }
         }
-
-        info!("WebSocket connection terminated");
     });
+
+    // Spawn task to poll for notifications from crossbeam and send to tokio
+    tokio::spawn(async move {
+        loop {
+            match crossbeam_receiver.try_recv() {
+                Ok(notification) => {
+                    if tokio_sender.send(notification).is_err() {
+                        break;
+                    }
+                }
+                Err(crossbeam::channel::TryRecvError::Empty) => {
+                    // No notification available, sleep briefly
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    // Channel disconnected, exit
+                    break;
+                }
+            }
+        }
+    });
+
+    while let Some(Ok(msg)) = msg_stream.next().await {
+        match msg {
+            Message::Text(text) => {
+                let response = match serde_json::from_str::<WsRequest>(&text) {
+                    Ok(request) => {
+                        handle_ws_request(request, &handle, &crossbeam_sender, &mut registered_configs).await
+                    }
+                    Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
+                };
+
+                let response_json = serde_json::to_string(&response).unwrap();
+                if let Err(e) = session.text(response_json).await {
+                    error!("Failed to send WebSocket response: {}", e);
+                    break;
+                }
+            }
+            Message::Ping(bytes) => {
+                if let Err(e) = session.pong(&bytes).await {
+                    error!("Failed to send pong: {}", e);
+                    break;
+                }
+            }
+            Message::Close(_) => {
+                info!("WebSocket connection closed by client");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Unregister all notifications on disconnect
+    for config in registered_configs.keys() {
+        let _ = handle.unregister_notification(config.clone(), crossbeam_sender.clone()).await;
+    }
+
+    info!("WebSocket connection terminated");
 
     Ok(response)
 }
@@ -92,6 +154,8 @@ pub async fn ws_handler(
 async fn handle_ws_request(
     request: WsRequest,
     handle: &StoreHandle,
+    notification_sender: &channel::Sender<qlib_rs::Notification>,
+    registered_configs: &mut HashMap<qlib_rs::NotifyConfig, ()>,
 ) -> WsResponse {
     match request {
         WsRequest::Ping => WsResponse::success(serde_json::json!({ "message": "pong" })),
@@ -194,6 +258,44 @@ async fn handle_ws_request(
                 Err(e) => WsResponse::error(format!("Failed to find entities: {:?}", e)),
             }
         }
+        WsRequest::RegisterNotification { config } => {
+            match config_to_notify_config(&config, handle).await {
+                Ok(notify_config) => {
+                    if registered_configs.contains_key(&notify_config) {
+                        return WsResponse::error("Notification already registered".to_string());
+                    }
+                    match handle.register_notification(notify_config.clone(), notification_sender.clone()).await {
+                        Ok(_) => {
+                            registered_configs.insert(notify_config, ());
+                            WsResponse::success(serde_json::json!({
+                                "message": "Notification registered"
+                            }))
+                        }
+                        Err(e) => WsResponse::error(format!("Failed to register notification: {:?}", e)),
+                    }
+                }
+                Err(e) => WsResponse::error(format!("Invalid config: {}", e)),
+            }
+        }
+        WsRequest::UnregisterNotification { config } => {
+            match config_to_notify_config(&config, handle).await {
+                Ok(notify_config) => {
+                    if !registered_configs.contains_key(&notify_config) {
+                        return WsResponse::error("Notification not registered".to_string());
+                    }
+                    match handle.unregister_notification(notify_config.clone(), notification_sender.clone()).await {
+                        Ok(_) => {
+                            registered_configs.remove(&notify_config);
+                            WsResponse::success(serde_json::json!({
+                                "message": "Notification unregistered"
+                            }))
+                        }
+                        Err(e) => WsResponse::error(format!("Failed to unregister notification: {:?}", e)),
+                    }
+                }
+                Err(e) => WsResponse::error(format!("Invalid config: {}", e)),
+            }
+        }
     }
 }
 
@@ -236,5 +338,44 @@ fn json_to_qlib_value(json: &serde_json::Value) -> Result<qlib_rs::Value, String
         }
         serde_json::Value::Null => Ok(Value::EntityReference(None)),
         _ => Err("Unsupported JSON type".to_string()),
+    }
+}
+
+async fn config_to_notify_config(config: &NotifyConfigJson, handle: &StoreHandle) -> Result<qlib_rs::NotifyConfig, String> {
+    let field_type = handle.get_field_type(&config.field).await
+        .map_err(|e| format!("Failed to get field type: {:?}", e))?;
+
+    let mut context = Vec::new();
+    for path in &config.context {
+        let mut path_types = Vec::new();
+        for field_name in path {
+            let ft = handle.get_field_type(field_name).await
+                .map_err(|e| format!("Failed to get context field type: {:?}", e))?;
+            path_types.push(ft);
+        }
+        context.push(path_types);
+    }
+
+    if let Some(entity_id_str) = &config.entity_id {
+        let entity_id = entity_id_str.parse::<u64>()
+            .map(qlib_rs::EntityId)
+            .map_err(|_| "Invalid entity ID")?;
+        Ok(qlib_rs::NotifyConfig::EntityId {
+            entity_id,
+            field_type,
+            trigger_on_change: config.trigger_on_change,
+            context,
+        })
+    } else if let Some(entity_type_str) = &config.entity_type {
+        let entity_type = handle.get_entity_type(entity_type_str).await
+            .map_err(|e| format!("Failed to get entity type: {:?}", e))?;
+        Ok(qlib_rs::NotifyConfig::EntityType {
+            entity_type,
+            field_type,
+            trigger_on_change: config.trigger_on_change,
+            context,
+        })
+    } else {
+        Err("Either entity_id or entity_type must be provided".to_string())
     }
 }

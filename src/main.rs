@@ -44,7 +44,7 @@ async fn main() -> std::io::Result<()> {
     info!("JWT secret configured");
 
     // Create StoreService and get handle
-    let (store_handle, store_service) = StoreService::new(store_proxy);
+    let (store_handle, mut store_service) = StoreService::new(store_proxy);
 
     // Spawn the StoreService in a separate task
     tokio::spawn(async move {
