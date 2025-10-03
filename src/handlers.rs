@@ -1,87 +1,14 @@
 use actix_web::{web, HttpResponse, Responder};
-use log::{error, info};
-use qlib_rs::data::{AsyncStoreProxy, EntityId, PageOpts};
+use qlib_rs::data::{EntityId, PageOpts};
 
 use crate::models::{
-    ApiResponse, ConnectRequest, CreateRequest, DeleteRequest, FindRequest, ReadRequest,
+    ApiResponse, CreateRequest, DeleteRequest, FindRequest, ReadRequest,
     SchemaRequest, WriteRequest,
 };
 use crate::AppState;
 
-pub async fn index() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "qweb",
-        "description": "Web API gateway for qcore-rs",
-        "version": "0.1.0",
-        "endpoints": {
-            "health": "GET /health",
-            "connect": "POST /api/connect",
-            "disconnect": "POST /api/disconnect",
-            "read": "POST /api/read",
-            "write": "POST /api/write",
-            "create": "POST /api/create",
-            "delete": "POST /api/delete",
-            "find": "POST /api/find",
-            "schema": "POST /api/schema",
-            "websocket": "GET /ws"
-        }
-    }))
-}
-
-pub async fn health() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "qweb"
-    }))
-}
-
-pub async fn connect(
-    state: web::Data<AppState>,
-    req: web::Json<ConnectRequest>,
-) -> impl Responder {
-    let address = req.address.clone().unwrap_or_else(|| state.store_address.clone());
-    
-    info!("Connecting to qcore-rs at: {}", address);
-    
-    match AsyncStoreProxy::connect(&address).await {
-        Ok(proxy) => {
-            let mut store = state.store_proxy.write().await;
-            *store = Some(proxy);
-            info!("Successfully connected to qcore-rs");
-            HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-                "message": "Connected to qcore-rs",
-                "address": address
-            })))
-        }
-        Err(e) => {
-            error!("Failed to connect to qcore-rs: {:?}", e);
-            HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!(
-                "Failed to connect: {:?}",
-                e
-            )))
-        }
-    }
-}
-
-pub async fn disconnect(state: web::Data<AppState>) -> impl Responder {
-    let mut store = state.store_proxy.write().await;
-    *store = None;
-    info!("Disconnected from qcore-rs");
-    HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-        "message": "Disconnected from qcore-rs"
-    })))
-}
-
 pub async fn read(state: web::Data<AppState>, req: web::Json<ReadRequest>) -> impl Responder {
-    let store = state.store_proxy.read().await;
-    
-    let proxy = match store.as_ref() {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest()
-                .json(ApiResponse::<()>::error("Not connected to qcore-rs".to_string()))
-        }
-    };
+    let proxy = state.store_proxy.read().await;
 
     let entity_id = match req.entity_id.parse::<u64>() {
         Ok(id) => EntityId(id),
@@ -120,15 +47,7 @@ pub async fn read(state: web::Data<AppState>, req: web::Json<ReadRequest>) -> im
 }
 
 pub async fn write(state: web::Data<AppState>, req: web::Json<WriteRequest>) -> impl Responder {
-    let store = state.store_proxy.read().await;
-    
-    let proxy = match store.as_ref() {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest()
-                .json(ApiResponse::<()>::error("Not connected to qcore-rs".to_string()))
-        }
-    };
+    let proxy = state.store_proxy.read().await;
 
     let entity_id = match req.entity_id.parse::<u64>() {
         Ok(id) => EntityId(id),
@@ -166,15 +85,7 @@ pub async fn write(state: web::Data<AppState>, req: web::Json<WriteRequest>) -> 
 }
 
 pub async fn create(state: web::Data<AppState>, req: web::Json<CreateRequest>) -> impl Responder {
-    let store = state.store_proxy.read().await;
-    
-    let proxy = match store.as_ref() {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest()
-                .json(ApiResponse::<()>::error("Not connected to qcore-rs".to_string()))
-        }
-    };
+    let proxy = state.store_proxy.read().await;
 
     let entity_type = match proxy.get_entity_type(&req.entity_type).await {
         Ok(et) => et,
@@ -198,15 +109,7 @@ pub async fn create(state: web::Data<AppState>, req: web::Json<CreateRequest>) -
 }
 
 pub async fn delete(state: web::Data<AppState>, req: web::Json<DeleteRequest>) -> impl Responder {
-    let store = state.store_proxy.read().await;
-    
-    let proxy = match store.as_ref() {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest()
-                .json(ApiResponse::<()>::error("Not connected to qcore-rs".to_string()))
-        }
-    };
+    let proxy = state.store_proxy.read().await;
 
     let entity_id = match req.entity_id.parse::<u64>() {
         Ok(id) => EntityId(id),
@@ -226,15 +129,7 @@ pub async fn delete(state: web::Data<AppState>, req: web::Json<DeleteRequest>) -
 }
 
 pub async fn find(state: web::Data<AppState>, req: web::Json<FindRequest>) -> impl Responder {
-    let store = state.store_proxy.read().await;
-    
-    let proxy = match store.as_ref() {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest()
-                .json(ApiResponse::<()>::error("Not connected to qcore-rs".to_string()))
-        }
-    };
+    let proxy = state.store_proxy.read().await;
 
     let entity_type = match proxy.get_entity_type(&req.entity_type).await {
         Ok(et) => et,
@@ -267,15 +162,7 @@ pub async fn find(state: web::Data<AppState>, req: web::Json<FindRequest>) -> im
 }
 
 pub async fn schema(state: web::Data<AppState>, req: web::Json<SchemaRequest>) -> impl Responder {
-    let store = state.store_proxy.read().await;
-    
-    let proxy = match store.as_ref() {
-        Some(p) => p,
-        None => {
-            return HttpResponse::BadRequest()
-                .json(ApiResponse::<()>::error("Not connected to qcore-rs".to_string()))
-        }
-    };
+    let proxy = state.store_proxy.read().await;
 
     let entity_type = match proxy.get_entity_type(&req.entity_type).await {
         Ok(et) => et,

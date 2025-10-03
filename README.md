@@ -38,82 +38,7 @@ Configure the application using environment variables:
 
 ## HTTP API
 
-### Service Information
-
-#### GET /
-
-Returns service information and available endpoints.
-
-**Response:**
-```json
-{
-  "service": "qweb",
-  "description": "Web API gateway for qcore-rs",
-  "version": "0.1.0",
-  "endpoints": {
-    "health": "GET /health",
-    "connect": "POST /api/connect",
-    "disconnect": "POST /api/disconnect",
-    "read": "POST /api/read",
-    "write": "POST /api/write",
-    "create": "POST /api/create",
-    "delete": "POST /api/delete",
-    "find": "POST /api/find",
-    "schema": "POST /api/schema",
-    "websocket": "GET /ws"
-  }
-}
-```
-
-#### GET /health
-
-Health check endpoint.
-
-**Response:**
-```json
-{
-  "status": "healthy",
-  "service": "qweb"
-}
-```
-
-### Connection Management
-
-#### POST /api/connect
-
-Establish connection to qcore-rs server.
-
-**Request:**
-```json
-{
-  "address": "127.0.0.1:8080"  // Optional, uses QCORE_ADDRESS if not provided
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "data": {
-    "message": "Connected to qcore-rs",
-    "address": "127.0.0.1:8080"
-  }
-}
-```
-
-#### POST /api/disconnect
-
-Disconnect from qcore-rs server.
-
-**Response:**
-```json
-{
-  "success": true,
-  "data": {
-    "message": "Disconnected from qcore-rs"
-  }
-}
-```
+The application automatically connects to qcore-rs on startup using the `QCORE_ADDRESS` environment variable (default: `127.0.0.1:8080`). All endpoints are ready to use immediately after the server starts.
 
 ### Entity Operations
 
@@ -262,21 +187,13 @@ Get entity schema information.
 
 ## WebSocket API
 
-Connect to the WebSocket endpoint at `ws://localhost:3000/ws` for persistent connections.
+Connect to the WebSocket endpoint at `ws://localhost:3000/ws` for persistent connections. The WebSocket uses the same qcore-rs connection established at server startup.
 
 ### Message Format
 
 All messages are JSON with a `type` field indicating the operation.
 
 ### Supported Operations
-
-#### Connect
-```json
-{
-  "type": "Connect",
-  "address": "127.0.0.1:8080"  // Optional
-}
-```
 
 #### Ping
 ```json
@@ -376,21 +293,16 @@ All API responses include a `success` field. On error:
 ```
 
 Common error scenarios:
-- Not connected to qcore-rs server
 - Invalid entity ID format
 - Entity or field type not found
 - Invalid field value type
+- Connection to qcore-rs lost
 
 ## Examples
 
 ### Using cURL
 
 ```bash
-# Connect to qcore-rs
-curl -X POST http://localhost:3000/api/connect \
-  -H "Content-Type: application/json" \
-  -d '{"address": "127.0.0.1:8080"}'
-
 # Create an entity
 curl -X POST http://localhost:3000/api/create \
   -H "Content-Type: application/json" \
@@ -417,32 +329,26 @@ curl -X POST http://localhost:3000/api/find \
 ```javascript
 const ws = new WebSocket('ws://localhost:3000/ws');
 
-ws.onopen = () => {
-  // Connect to qcore-rs
-  ws.send(JSON.stringify({
-    type: "Connect",
-    address: "127.0.0.1:8080"
-  }));
-};
-
 ws.onmessage = (event) => {
   const response = JSON.parse(event.data);
   console.log('Response:', response);
 };
 
-// Create an entity
-ws.send(JSON.stringify({
-  type: "Create",
-  entity_type: "User",
-  name: "bob"
-}));
-
-// Read from entity
-ws.send(JSON.stringify({
-  type: "Read",
-  entity_id: "12884901888",
-  fields: ["Name", "Email"]
-}));
+ws.onopen = () => {
+  // Create an entity
+  ws.send(JSON.stringify({
+    type: "Create",
+    entity_type: "User",
+    name: "bob"
+  }));
+  
+  // Read from entity
+  ws.send(JSON.stringify({
+    type: "Read",
+    entity_id: "12884901888",
+    fields: ["Name", "Email"]
+  }));
+};
 ```
 
 ## Architecture

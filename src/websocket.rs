@@ -2,15 +2,16 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::Message;
 use futures_util::StreamExt;
 use log::{error, info};
-use qlib_rs::data::AsyncStoreProxy;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use qlib_rs::data::AsyncStoreProxy;
 
 use crate::AppState;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum WsRequest {
-    Connect { address: Option<String> },
     Read { entity_id: String, fields: Vec<String> },
     Write { entity_id: String, field: String, value: serde_json::Value },
     Create { entity_type: String, name: String },
@@ -53,15 +54,14 @@ pub async fn ws_handler(
     
     info!("WebSocket connection established");
 
-    let mut proxy: Option<AsyncStoreProxy> = None;
-    let default_address = state.store_address.clone();
+    let proxy = state.store_proxy.clone();
 
     actix_web::rt::spawn(async move {
         while let Some(Ok(msg)) = msg_stream.next().await {
             match msg {
                 Message::Text(text) => {
                     let response = match serde_json::from_str::<WsRequest>(&text) {
-                        Ok(request) => handle_ws_request(request, &mut proxy, &default_address).await,
+                        Ok(request) => handle_ws_request(request, &proxy).await,
                         Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
                     };
 
@@ -93,30 +93,13 @@ pub async fn ws_handler(
 
 async fn handle_ws_request(
     request: WsRequest,
-    proxy: &mut Option<AsyncStoreProxy>,
-    default_address: &str,
+    proxy: &Arc<RwLock<AsyncStoreProxy>>,
 ) -> WsResponse {
     match request {
-        WsRequest::Connect { address } => {
-            let addr = address.as_deref().unwrap_or(default_address);
-            match AsyncStoreProxy::connect(addr).await {
-                Ok(new_proxy) => {
-                    *proxy = Some(new_proxy);
-                    WsResponse::success(serde_json::json!({
-                        "message": "Connected to qcore-rs",
-                        "address": addr
-                    }))
-                }
-                Err(e) => WsResponse::error(format!("Failed to connect: {:?}", e)),
-            }
-        }
         WsRequest::Ping => WsResponse::success(serde_json::json!({ "message": "pong" })),
         
         WsRequest::Read { entity_id, fields } => {
-            let p = match proxy.as_ref() {
-                Some(p) => p,
-                None => return WsResponse::error("Not connected to qcore-rs".to_string()),
-            };
+            let p = proxy.read().await;
 
             let entity_id = match entity_id.parse::<u64>() {
                 Ok(id) => qlib_rs::data::EntityId(id),
@@ -148,10 +131,7 @@ async fn handle_ws_request(
         }
 
         WsRequest::Write { entity_id, field, value } => {
-            let p = match proxy.as_ref() {
-                Some(p) => p,
-                None => return WsResponse::error("Not connected to qcore-rs".to_string()),
-            };
+            let p = proxy.read().await;
 
             let entity_id = match entity_id.parse::<u64>() {
                 Ok(id) => qlib_rs::data::EntityId(id),
@@ -177,10 +157,7 @@ async fn handle_ws_request(
         }
 
         WsRequest::Create { entity_type, name } => {
-            let p = match proxy.as_ref() {
-                Some(p) => p,
-                None => return WsResponse::error("Not connected to qcore-rs".to_string()),
-            };
+            let p = proxy.read().await;
 
             let et = match p.get_entity_type(&entity_type).await {
                 Ok(et) => et,
@@ -198,10 +175,7 @@ async fn handle_ws_request(
         }
 
         WsRequest::Delete { entity_id } => {
-            let p = match proxy.as_ref() {
-                Some(p) => p,
-                None => return WsResponse::error("Not connected to qcore-rs".to_string()),
-            };
+            let p = proxy.read().await;
 
             let entity_id = match entity_id.parse::<u64>() {
                 Ok(id) => qlib_rs::data::EntityId(id),
@@ -217,10 +191,7 @@ async fn handle_ws_request(
         }
 
         WsRequest::Find { entity_type, filter } => {
-            let p = match proxy.as_ref() {
-                Some(p) => p,
-                None => return WsResponse::error("Not connected to qcore-rs".to_string()),
-            };
+            let p = proxy.read().await;
 
             let et = match p.get_entity_type(&entity_type).await {
                 Ok(et) => et,

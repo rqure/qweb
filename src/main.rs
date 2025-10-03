@@ -1,5 +1,5 @@
 use actix_web::{web, App, HttpServer};
-use log::info;
+use log::{error, info};
 use qlib_rs::data::AsyncStoreProxy;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -9,8 +9,7 @@ mod models;
 mod websocket;
 
 pub struct AppState {
-    store_proxy: Arc<RwLock<Option<AsyncStoreProxy>>>,
-    store_address: String,
+    store_proxy: Arc<RwLock<AsyncStoreProxy>>,
 }
 
 #[actix_web::main]
@@ -21,11 +20,24 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     
     info!("Starting qweb server");
-    info!("Configured to connect to qcore-rs at: {}", store_address);
+    info!("Connecting to qcore-rs at: {}", store_address);
+
+    // Connect to qcore-rs on startup
+    let store_proxy = match AsyncStoreProxy::connect(&store_address).await {
+        Ok(proxy) => {
+            info!("Successfully connected to qcore-rs");
+            proxy
+        }
+        Err(e) => {
+            error!("Failed to connect to qcore-rs at {}: {:?}", store_address, e);
+            return Err(std::io::Error::other(
+                format!("Failed to connect to qcore-rs: {:?}", e),
+            ));
+        }
+    };
 
     let app_state = web::Data::new(AppState {
-        store_proxy: Arc::new(RwLock::new(None)),
-        store_address: store_address.clone(),
+        store_proxy: Arc::new(RwLock::new(store_proxy)),
     });
 
     let bind_address = std::env::var("BIND_ADDRESS")
@@ -36,10 +48,6 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
-            .route("/", web::get().to(handlers::index))
-            .route("/health", web::get().to(handlers::health))
-            .route("/api/connect", web::post().to(handlers::connect))
-            .route("/api/disconnect", web::post().to(handlers::disconnect))
             .route("/api/read", web::post().to(handlers::read))
             .route("/api/write", web::post().to(handlers::write))
             .route("/api/create", web::post().to(handlers::create))

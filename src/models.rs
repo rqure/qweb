@@ -1,11 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ConnectRequest {
-    pub address: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ReadRequest {
     pub entity_id: String,
     pub fields: Vec<String>,
