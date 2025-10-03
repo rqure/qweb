@@ -468,7 +468,7 @@ fn json_to_value(json: &serde_json::Value) -> Result<qlib_rs::Value, String> {
     }
 }
 
-fn get_subject_from_request(req: &HttpRequest, jwt_secret: &str) -> Result<EntityId, String> {
+pub fn get_subject_from_request(req: &HttpRequest, jwt_secret: &str) -> Result<EntityId, String> {
     let auth_header = req.headers().get("Authorization").ok_or("No Authorization header")?;
 
     let auth_str = auth_header.to_str().map_err(|_| "Invalid header")?;
