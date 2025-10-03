@@ -486,12 +486,17 @@ impl StoreService {
 
     /// Run the service, processing commands until the channel is closed
     pub async fn run(&mut self) {
-        while let Some(command) = self.receiver.recv().await {
-            self.handle_command(command);
+        loop {
+            // Process all available commands
+            while let Ok(command) = self.receiver.try_recv() {
+                self.handle_command(command);
+            }
             // Process any pending notifications
             if let Err(e) = self.proxy.process_notifications() {
                 log::warn!("Failed to process notifications: {:?}", e);
             }
+            // Sleep for 10ms
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
 
