@@ -1,10 +1,12 @@
 use actix_web::{web, HttpResponse, Responder, HttpRequest};
-use qlib_rs::{EntityId, PageOpts};
+use qlib_rs::{EntityId, PageOpts, EntityType, FieldType};
 use qlib_rs::auth::AuthorizationScope;
 
 use crate::models::{
     ApiResponse, CreateRequest, DeleteRequest, FindRequest, ReadRequest,
     SchemaRequest, WriteRequest, LoginRequest, LoginResponse,
+    ResolveEntityTypeRequest, ResolveFieldTypeRequest, GetFieldSchemaRequest,
+    EntityExistsRequest, FieldExistsRequest, ResolveIndirectionRequest,
 };
 use crate::AppState;
 
@@ -247,6 +249,189 @@ pub async fn schema(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
         }))),
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to get schema: {:?}", e))),
+    }
+}
+
+pub async fn resolve_entity_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ResolveEntityTypeRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
+    };
+
+    let entity_type = match body.entity_type.parse::<u32>() {
+        Ok(id) => EntityType(id),
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(ApiResponse::<()>::error(format!("Invalid entity_type: {}", e)));
+        }
+    };
+
+    match handle.resolve_entity_type(entity_type).await {
+        Ok(name) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+            "entity_type": body.entity_type,
+            "name": name
+        }))),
+        Err(e) => HttpResponse::InternalServerError()
+            .json(ApiResponse::<()>::error(format!("Failed to resolve entity type: {:?}", e))),
+    }
+}
+
+pub async fn resolve_field_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ResolveFieldTypeRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
+    };
+
+    let field_type = match body.field_type.parse::<u64>() {
+        Ok(id) => FieldType(id),
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(ApiResponse::<()>::error(format!("Invalid field_type: {}", e)));
+        }
+    };
+
+    match handle.resolve_field_type(field_type).await {
+        Ok(name) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+            "field_type": body.field_type,
+            "name": name
+        }))),
+        Err(e) => HttpResponse::InternalServerError()
+            .json(ApiResponse::<()>::error(format!("Failed to resolve field type: {:?}", e))),
+    }
+}
+
+pub async fn get_field_schema(req: HttpRequest, state: web::Data<AppState>, body: web::Json<GetFieldSchemaRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
+    };
+
+    let entity_type = match body.entity_type.parse::<u32>() {
+        Ok(id) => EntityType(id),
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(ApiResponse::<()>::error(format!("Invalid entity_type: {}", e)));
+        }
+    };
+
+    let field_type = match body.field_type.parse::<u64>() {
+        Ok(id) => FieldType(id),
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(ApiResponse::<()>::error(format!("Invalid field_type: {}", e)));
+        }
+    };
+
+    match handle.get_field_schema(entity_type, field_type).await {
+        Ok(schema) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+            "entity_type": body.entity_type,
+            "field_type": body.field_type,
+            "schema": format!("{:?}", schema)
+        }))),
+        Err(e) => HttpResponse::InternalServerError()
+            .json(ApiResponse::<()>::error(format!("Failed to get field schema: {:?}", e))),
+    }
+}
+
+pub async fn entity_exists(req: HttpRequest, state: web::Data<AppState>, body: web::Json<EntityExistsRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
+    };
+
+    let entity_id = match body.entity_id.parse::<u64>() {
+        Ok(id) => EntityId(id),
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(ApiResponse::<()>::error(format!("Invalid entity_id: {}", e)));
+        }
+    };
+
+    let exists = handle.entity_exists(entity_id).await;
+    HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+        "entity_id": body.entity_id,
+        "exists": exists
+    })))
+}
+
+pub async fn field_exists(req: HttpRequest, state: web::Data<AppState>, body: web::Json<FieldExistsRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
+    };
+
+    let entity_type = match body.entity_type.parse::<u32>() {
+        Ok(id) => EntityType(id),
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(ApiResponse::<()>::error(format!("Invalid entity_type: {}", e)));
+        }
+    };
+
+    let field_type = match body.field_type.parse::<u64>() {
+        Ok(id) => FieldType(id),
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(ApiResponse::<()>::error(format!("Invalid field_type: {}", e)));
+        }
+    };
+
+    let exists = handle.field_exists(entity_type, field_type).await;
+    HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+        "entity_type": body.entity_type,
+        "field_type": body.field_type,
+        "exists": exists
+    })))
+}
+
+pub async fn resolve_indirection(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ResolveIndirectionRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
+    };
+
+    let entity_id = match body.entity_id.parse::<u64>() {
+        Ok(id) => EntityId(id),
+        Err(e) => {
+            return HttpResponse::BadRequest()
+                .json(ApiResponse::<()>::error(format!("Invalid entity_id: {}", e)));
+        }
+    };
+
+    let mut field_types = Vec::new();
+    for field_name in &body.fields {
+        match handle.get_field_type(field_name).await {
+            Ok(ft) => field_types.push(ft),
+            Err(e) => {
+                return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
+                    "Failed to get field type for '{}': {:?}",
+                    field_name, e
+                )));
+            }
+        }
+    }
+
+    match handle.resolve_indirection(entity_id, &field_types).await {
+        Ok((resolved_entity_id, resolved_field_type)) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+            "entity_id": body.entity_id,
+            "fields": body.fields,
+            "resolved_entity_id": resolved_entity_id.0.to_string(),
+            "resolved_field_type": resolved_field_type.0.to_string()
+        }))),
+        Err(e) => HttpResponse::InternalServerError()
+            .json(ApiResponse::<()>::error(format!("Failed to resolve indirection: {:?}", e))),
     }
 }
 

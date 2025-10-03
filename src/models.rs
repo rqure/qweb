@@ -49,6 +49,39 @@ pub struct SchemaRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ResolveEntityTypeRequest {
+    pub entity_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResolveFieldTypeRequest {
+    pub field_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetFieldSchemaRequest {
+    pub entity_type: String,
+    pub field_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EntityExistsRequest {
+    pub entity_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FieldExistsRequest {
+    pub entity_type: String,
+    pub field_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResolveIndirectionRequest {
+    pub entity_id: String,
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiResponse<T> {
     pub success: bool,
     pub data: Option<T>,

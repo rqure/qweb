@@ -1,7 +1,7 @@
 use qlib_rs::{
     AdjustBehavior, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, PageOpts,
     PageResult, PushCondition, Result, Single, StoreProxy, Timestamp, Value,
-    auth::{authenticate_user, get_scope, AuthorizationScope}, AuthConfig, Cache, CelExecutor,
+    auth::AuthorizationScope,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -583,7 +583,7 @@ impl StoreService {
                 let _ = respond_to.send(result);
             }
             StoreCommand::AuthenticateUser { name, password, respond_to } => {
-                let result = qlib_rs::auth::authenticate_user(&self.proxy, &name, &password, &self.auth_config);
+                let result = qlib_rs::auth::authenticate_user(&mut self.proxy, &name, &password, &self.auth_config);
                 let _ = respond_to.send(result);
             }
             StoreCommand::GetScope { subject_id, resource_id, field, respond_to } => {

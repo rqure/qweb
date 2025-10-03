@@ -68,6 +68,12 @@ async fn main() -> std::io::Result<()> {
             .route("/api/delete", web::post().to(handlers::delete))
             .route("/api/find", web::post().to(handlers::find))
             .route("/api/schema", web::post().to(handlers::schema))
+            .route("/api/resolve_entity_type", web::post().to(handlers::resolve_entity_type))
+            .route("/api/resolve_field_type", web::post().to(handlers::resolve_field_type))
+            .route("/api/get_field_schema", web::post().to(handlers::get_field_schema))
+            .route("/api/entity_exists", web::post().to(handlers::entity_exists))
+            .route("/api/field_exists", web::post().to(handlers::field_exists))
+            .route("/api/resolve_indirection", web::post().to(handlers::resolve_indirection))
             .route("/ws", web::get().to(websocket::ws_handler))
     })
     .bind(bind_address)?
