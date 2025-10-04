@@ -269,6 +269,15 @@ async fn handle_ws_request(
                 Err(e) => return WsResponse::error(format!("Failed to get entity type: {:?}", e)),
             };
 
+            let scope = match handle.get_scope(subject_id, qlib_rs::EntityId::new(et, 0), qlib_rs::FieldType(0)).await {
+                Ok(s) => s,
+                Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
+            };
+
+            if scope != qlib_rs::auth::AuthorizationScope::ReadWrite {
+                return WsResponse::error("Access denied".to_string());
+            }
+
             match handle.create_entity(et, None, &name).await {
                 Ok(entity_id) => WsResponse::success(serde_json::json!({
                     "entity_id": entity_id.0.to_string(),
@@ -285,12 +294,21 @@ async fn handle_ws_request(
                 None => return WsResponse::error("Authentication required".to_string()),
             };
 
-            let entity_id = match entity_id.parse::<u64>() {
+            let entity_id_parsed = match entity_id.parse::<u64>() {
                 Ok(id) => qlib_rs::EntityId(id),
                 Err(e) => return WsResponse::error(format!("Invalid entity ID: {}", e)),
             };
 
-            match handle.delete_entity(entity_id).await {
+            let scope = match handle.get_scope(subject_id, entity_id_parsed, qlib_rs::FieldType(0)).await {
+                Ok(s) => s,
+                Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
+            };
+
+            if scope != qlib_rs::auth::AuthorizationScope::ReadWrite {
+                return WsResponse::error("Access denied".to_string());
+            }
+
+            match handle.delete_entity(entity_id_parsed).await {
                 Ok(_) => WsResponse::success(serde_json::json!({
                     "message": "Successfully deleted entity"
                 })),

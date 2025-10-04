@@ -135,7 +135,7 @@ pub async fn write(req: HttpRequest, state: web::Data<AppState>, body: web::Json
 pub async fn create(req: HttpRequest, state: web::Data<AppState>, body: web::Json<CreateRequest>) -> impl Responder {
     let handle = &state.store_handle;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -149,6 +149,15 @@ pub async fn create(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
             )));
         }
     };
+
+    let scope = match handle.get_scope(subject_id, EntityId::new(entity_type, 0), FieldType(0)).await {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Authorization check failed: {:?}", e))),
+    };
+
+    if scope != AuthorizationScope::ReadWrite {
+        return HttpResponse::Forbidden().json(ApiResponse::<()>::error("Access denied".to_string()));
+    }
 
     match handle.create_entity(entity_type, None, &body.name).await {
         Ok(entity_id) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
@@ -164,7 +173,7 @@ pub async fn create(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
 pub async fn delete(req: HttpRequest, state: web::Data<AppState>, body: web::Json<DeleteRequest>) -> impl Responder {
     let handle = &state.store_handle;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -175,6 +184,15 @@ pub async fn delete(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
             return HttpResponse::BadRequest()
                 .json(ApiResponse::<()>::error(format!("Invalid entity ID: {}", e)))
         }
+    };
+
+    let scope = match handle.get_scope(subject_id, entity_id, FieldType(0)).await {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Authorization check failed: {:?}", e))),
+    };
+
+    if scope != AuthorizationScope::ReadWrite {
+        return HttpResponse::Forbidden().json(ApiResponse::<()>::error("Access denied".to_string()));
     };
 
     match handle.delete_entity(entity_id).await {
