@@ -205,7 +205,7 @@ async fn handle_ws_request(
                     Ok(s) => s,
                     Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
                 };
-                if scope != AuthorizationScope::ReadWrite {
+                if scope == AuthorizationScope::None {
                     return WsResponse::error("Access denied".to_string());
                 }
             }
