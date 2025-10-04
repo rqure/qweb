@@ -10,7 +10,7 @@ use crossbeam::channel;
 use crate::store_service::StoreHandle;
 use crate::AppState;
 
-use qlib_rs::{EntityId, Notification, NotifyConfig, auth::AuthorizationScope};
+use qlib_rs::{auth::AuthorizationScope};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NotifyConfigJson {
