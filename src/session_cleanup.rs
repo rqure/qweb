@@ -85,7 +85,7 @@ pub async fn session_cleanup_task(handle: StoreHandle, qweb_service_id: EntityId
     info!("Session cleanup task registered for notifications");
     
     // Initial load: read sessions owned by this qweb instance and their expiration times
-    let filter = format!("Parent == \"{}\"", qweb_service_id.0);
+    let filter = format!("Parent == {}", qweb_service_id.0);
     let sessions = match handle.find_entities(session_entity_type, Some(&filter)).await {
         Ok(entities) => entities,
         Err(e) => {
