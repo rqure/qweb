@@ -49,6 +49,11 @@ pub struct SchemaRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CompleteSchemaRequest {
+    pub entity_type: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveEntityTypeRequest {
     pub entity_type: String,
 }

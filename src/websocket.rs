@@ -32,6 +32,7 @@ enum WsRequest {
     RegisterNotification { config: NotifyConfigJson },
     UnregisterNotification { config: NotifyConfigJson },
     Schema { entity_type: String },
+    CompleteSchema { entity_type: String },
     ResolveEntityType { entity_type: String },
     ResolveFieldType { field_type: String },
     GetFieldSchema { entity_type: String, field_type: String },
@@ -389,11 +390,35 @@ async fn handle_ws_request(
             };
 
             match handle.get_entity_schema(et).await {
-                Ok(schema) => WsResponse::success(serde_json::json!({
-                    "entity_type": entity_type,
-                    "schema": format!("{:?}", schema)
-                })),
+                Ok(schema) => {
+                    match serde_json::to_value(&schema) {
+                        Ok(schema_json) => WsResponse::success(serde_json::json!({
+                            "entity_type": entity_type,
+                            "schema": schema_json
+                        })),
+                        Err(e) => WsResponse::error(format!("Failed to serialize schema: {:?}", e)),
+                    }
+                }
                 Err(e) => WsResponse::error(format!("Failed to get schema: {:?}", e)),
+            }
+        }
+        WsRequest::CompleteSchema { entity_type } => {
+            let et = match handle.get_entity_type(&entity_type).await {
+                Ok(et) => et,
+                Err(e) => return WsResponse::error(format!("Failed to get entity type: {:?}", e)),
+            };
+
+            match handle.get_complete_entity_schema(et).await {
+                Ok(schema) => {
+                    match serde_json::to_value(&schema) {
+                        Ok(schema_json) => WsResponse::success(serde_json::json!({
+                            "entity_type": entity_type,
+                            "schema": schema_json
+                        })),
+                        Err(e) => WsResponse::error(format!("Failed to serialize schema: {:?}", e)),
+                    }
+                }
+                Err(e) => WsResponse::error(format!("Failed to get complete schema: {:?}", e)),
             }
         }
         WsRequest::ResolveEntityType { entity_type } => {

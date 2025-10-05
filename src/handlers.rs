@@ -4,7 +4,7 @@ use qlib_rs::auth::AuthorizationScope;
 
 use crate::models::{
     ApiResponse, CreateRequest, DeleteRequest, FindRequest, ReadRequest,
-    SchemaRequest, WriteRequest, LoginRequest, LoginResponse,
+    SchemaRequest, CompleteSchemaRequest, WriteRequest, LoginRequest, LoginResponse,
     ResolveEntityTypeRequest, ResolveFieldTypeRequest, GetFieldSchemaRequest,
     EntityExistsRequest, FieldExistsRequest, ResolveIndirectionRequest,
 };
@@ -261,12 +261,52 @@ pub async fn schema(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
     };
 
     match handle.get_entity_schema(entity_type).await {
-        Ok(schema) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-            "entity_type": body.entity_type,
-            "schema": format!("{:?}", schema)
-        }))),
+        Ok(schema) => {
+            match serde_json::to_value(&schema) {
+                Ok(schema_json) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+                    "entity_type": body.entity_type,
+                    "schema": schema_json
+                }))),
+                Err(e) => HttpResponse::InternalServerError()
+                    .json(ApiResponse::<()>::error(format!("Failed to serialize schema: {:?}", e))),
+            }
+        }
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to get schema: {:?}", e))),
+    }
+}
+
+pub async fn complete_schema(req: HttpRequest, state: web::Data<AppState>, body: web::Json<CompleteSchemaRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
+    };
+
+    let entity_type = match handle.get_entity_type(&body.entity_type).await {
+        Ok(et) => et,
+        Err(e) => {
+            return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
+                "Failed to get entity type: {:?}",
+                e
+            )))
+        }
+    };
+
+    match handle.get_complete_entity_schema(entity_type).await {
+        Ok(schema) => {
+            match serde_json::to_value(&schema) {
+                Ok(schema_json) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+                    "entity_type": body.entity_type,
+                    "schema": schema_json
+                }))),
+                Err(e) => HttpResponse::InternalServerError()
+                    .json(ApiResponse::<()>::error(format!("Failed to serialize schema: {:?}", e))),
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .json(ApiResponse::<()>::error(format!("Failed to get complete schema: {:?}", e))),
     }
 }
 

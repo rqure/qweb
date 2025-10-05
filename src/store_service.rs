@@ -1,5 +1,5 @@
 use qlib_rs::{
-    AdjustBehavior, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, PageOpts,
+    AdjustBehavior, Complete, EntityId, EntitySchema, EntityType, FieldSchema, FieldType, PageOpts,
     PageResult, PushCondition, Result, Single, StoreProxy, Timestamp, Value,
     auth::AuthorizationScope, Notification, NotifyConfig,
 };
@@ -27,6 +27,10 @@ pub enum StoreCommand {
     GetEntitySchema {
         entity_type: EntityType,
         respond_to: oneshot::Sender<Result<EntitySchema<Single>>>,
+    },
+    GetCompleteEntitySchema {
+        entity_type: EntityType,
+        respond_to: oneshot::Sender<Result<EntitySchema<Complete>>>,
     },
     GetFieldSchema {
         entity_type: EntityType,
@@ -170,7 +174,19 @@ impl StoreHandle {
             })
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
         rx.await
-            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service dropped".to_string()))?
+    }
+
+    pub async fn get_complete_entity_schema(&self, entity_type: EntityType) -> Result<EntitySchema<Complete>> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::GetCompleteEntitySchema {
+                entity_type,
+                respond_to: tx,
+            })
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service dropped".to_string()))?
     }
 
     pub async fn get_field_schema(
@@ -529,6 +545,13 @@ impl StoreService {
                 respond_to,
             } => {
                 let result = self.proxy.get_entity_schema(entity_type);
+                let _ = respond_to.send(result);
+            }
+            StoreCommand::GetCompleteEntitySchema {
+                entity_type,
+                respond_to,
+            } => {
+                let result = self.proxy.get_complete_entity_schema(entity_type);
                 let _ = respond_to.send(result);
             }
             StoreCommand::GetFieldSchema {
