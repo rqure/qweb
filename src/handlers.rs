@@ -32,10 +32,15 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
         Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to find Sessions: {:?}", e))),
     };
 
-    // Get User field type
-    let user_field_type = match handle.get_field_type("User").await {
+    // Get field types
+    let current_user_field_type = match handle.get_field_type("CurrentUser").await {
         Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get User field type: {:?}", e))),
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get CurrentUser field type: {:?}", e))),
+    };
+
+    let previous_user_field_type = match handle.get_field_type("PreviousUser").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get PreviousUser field type: {:?}", e))),
     };
 
     let token_field_type = match handle.get_field_type("Token").await {
@@ -53,10 +58,11 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
         Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get CreatedAt field type: {:?}", e))),
     };
 
-    // Find an available Session (User field is None)
+    // Find an available Session (CurrentUser field is None)
+    // TODO: Filter to only sessions owned by this qweb service instance (check Parent field)
     let mut available_session = None;
     for session_id in sessions {
-        match handle.read(session_id, &[user_field_type]).await {
+        match handle.read(session_id, &[current_user_field_type]).await {
             Ok((value, _, _)) => {
                 if let qlib_rs::Value::EntityReference(None) = value {
                     available_session = Some(session_id);
@@ -72,9 +78,21 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
         None => return HttpResponse::ServiceUnavailable().json(ApiResponse::<()>::error("No available sessions. Maximum concurrent users reached.".to_string())),
     };
 
-    // Create JWT with session_id in claims
+    // Store PreviousUser before assigning new user
+    let previous_user = match handle.read(session_id, &[current_user_field_type]).await {
+        Ok((qlib_rs::Value::EntityReference(prev_user), _, _)) => prev_user,
+        _ => None,
+    };
+
+    if let Some(prev_user_id) = previous_user {
+        if let Err(e) = handle.write(session_id, &[previous_user_field_type], qlib_rs::Value::EntityReference(Some(prev_user_id)), None, None, None, None).await {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to store previous user: {:?}", e)));
+        }
+    }
+
+    // Create JWT with session_id in claims - 1 minute timeout
     use jsonwebtoken::{encode, Header, EncodingKey};
-    let expiration = chrono::Utc::now() + chrono::Duration::hours(1);
+    let expiration = chrono::Utc::now() + chrono::Duration::minutes(1);
     let claims = serde_json::json!({
         "sub": user_id.0.to_string(),
         "session_id": session_id.0.to_string(),
@@ -85,9 +103,24 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
         Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to generate token: {:?}", e))),
     };
 
-    // Update Session entity with User reference, token, and timestamps
-    if let Err(e) = handle.write(session_id, &[user_field_type], qlib_rs::Value::EntityReference(Some(user_id)), None, None, None, None).await {
+    // Read PreviousUser to preserve it
+    let previous_user_value = match handle.read(session_id, &[previous_user_field_type]).await {
+        Ok((value, _, _)) => value,
+        Err(_) => qlib_rs::Value::EntityReference(None),
+    };
+
+    // Update Session entity with CurrentUser reference, preserve or set PreviousUser, token, and timestamps
+    if let Err(e) = handle.write(session_id, &[current_user_field_type], qlib_rs::Value::EntityReference(Some(user_id)), None, None, None, None).await {
         return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to assign user to session: {:?}", e)));
+    }
+
+    // Set PreviousUser to the previous CurrentUser if there was one
+    let prev_user = match previous_user_value {
+        qlib_rs::Value::EntityReference(Some(prev_id)) => Some(prev_id),
+        _ => None,
+    };
+    if let Err(e) = handle.write(session_id, &[previous_user_field_type], qlib_rs::Value::EntityReference(prev_user), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to set previous user: {:?}", e)));
     }
 
     if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), None, None, None, None).await {
@@ -117,9 +150,14 @@ pub async fn logout(req: HttpRequest, state: web::Data<AppState>, _body: web::Js
     };
 
     // Get field types
-    let user_field_type = match handle.get_field_type("User").await {
+    let current_user_field_type = match handle.get_field_type("CurrentUser").await {
         Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get User field type: {:?}", e))),
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get CurrentUser field type: {:?}", e))),
+    };
+
+    let previous_user_field_type = match handle.get_field_type("PreviousUser").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get PreviousUser field type: {:?}", e))),
     };
 
     let token_field_type = match handle.get_field_type("Token").await {
@@ -132,8 +170,20 @@ pub async fn logout(req: HttpRequest, state: web::Data<AppState>, _body: web::Js
         Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
     };
 
-    // Clear the Session by setting User to None, clearing token and resetting expiration
-    if let Err(e) = handle.write(session_id, &[user_field_type], qlib_rs::Value::EntityReference(None), None, None, None, None).await {
+    // Save CurrentUser to PreviousUser before logout
+    let current_user = match handle.read(session_id, &[current_user_field_type]).await {
+        Ok((qlib_rs::Value::EntityReference(user), _, _)) => user,
+        _ => None,
+    };
+
+    if let Some(user_id) = current_user {
+        if let Err(e) = handle.write(session_id, &[previous_user_field_type], qlib_rs::Value::EntityReference(Some(user_id)), None, None, None, None).await {
+            return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to save previous user: {:?}", e)));
+        }
+    }
+
+    // Clear the Session by setting CurrentUser to None, clearing token and resetting expiration
+    if let Err(e) = handle.write(session_id, &[current_user_field_type], qlib_rs::Value::EntityReference(None), None, None, None, None).await {
         return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to clear session user: {:?}", e)));
     }
 
@@ -159,9 +209,9 @@ pub async fn refresh(req: HttpRequest, state: web::Data<AppState>, _body: web::J
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Invalid token: {}", e))),
     };
 
-    // Issue a new token with extended expiration
+    // Issue a new token with extended expiration (1 minute)
     use jsonwebtoken::{encode, Header, EncodingKey};
-    let expiration = chrono::Utc::now() + chrono::Duration::hours(1);
+    let expiration = chrono::Utc::now() + chrono::Duration::minutes(1);
     let claims = serde_json::json!({
         "sub": user_id.0.to_string(),
         "session_id": session_id.0.to_string(),
@@ -780,11 +830,11 @@ pub async fn get_subject_and_session_from_request(
     let session_id = EntityId(session_id_str.parse::<u64>().map_err(|_| "Invalid session_id")?);
 
     // Verify the Session is still valid
-    let user_field_type = handle.get_field_type("User").await.map_err(|e| format!("Failed to get User field type: {:?}", e))?;
+    let current_user_field_type = handle.get_field_type("CurrentUser").await.map_err(|e| format!("Failed to get CurrentUser field type: {:?}", e))?;
     let expires_at_field_type = handle.get_field_type("ExpiresAt").await.map_err(|e| format!("Failed to get ExpiresAt field type: {:?}", e))?;
 
-    // Check that the Session still has the User assigned
-    let (user_value, _, _) = handle.read(session_id, &[user_field_type]).await.map_err(|e| format!("Failed to read session: {:?}", e))?;
+    // Check that the Session still has the CurrentUser assigned
+    let (user_value, _, _) = handle.read(session_id, &[current_user_field_type]).await.map_err(|e| format!("Failed to read session: {:?}", e))?;
     match user_value {
         qlib_rs::Value::EntityReference(Some(stored_user_id)) if stored_user_id == user_id => {},
         _ => return Err("Session is no longer valid".to_string()),

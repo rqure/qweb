@@ -163,6 +163,29 @@ pub async fn ws_handler(
         let _ = handle.unregister_notification(config.clone(), crossbeam_sender.clone()).await;
     }
 
+    // Auto-logout: Clear session on disconnect
+    if let Some(ws_session_id) = session_id {
+        info!("WebSocket disconnected, auto-logging out session: {:?}", ws_session_id);
+        
+        // Get field types
+        if let (Ok(current_user_ft), Ok(previous_user_ft), Ok(token_ft), Ok(expires_at_ft)) = (
+            handle.get_field_type("CurrentUser").await,
+            handle.get_field_type("PreviousUser").await,
+            handle.get_field_type("Token").await,
+            handle.get_field_type("ExpiresAt").await,
+        ) {
+            // Save CurrentUser to PreviousUser
+            if let Ok((qlib_rs::Value::EntityReference(Some(user_id)), _, _)) = handle.read(ws_session_id, &[current_user_ft]).await {
+                let _ = handle.write(ws_session_id, &[previous_user_ft], qlib_rs::Value::EntityReference(Some(user_id)), None, None, None, None).await;
+            }
+            
+            // Clear the session
+            let _ = handle.write(ws_session_id, &[current_user_ft], qlib_rs::Value::EntityReference(None), None, None, None, None).await;
+            let _ = handle.write(ws_session_id, &[token_ft], qlib_rs::Value::String("".to_string()), None, None, None, None).await;
+            let _ = handle.write(ws_session_id, &[expires_at_ft], qlib_rs::Value::Timestamp(qlib_rs::epoch()), None, None, None, None).await;
+        }
+    }
+
     info!("WebSocket connection terminated");
 
     Ok(response)
@@ -197,7 +220,7 @@ async fn handle_ws_request(
             let jwt_secret = std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "default_secret".to_string());
             
-            let expiration = chrono::Utc::now() + chrono::Duration::hours(1);
+            let expiration = chrono::Utc::now() + chrono::Duration::minutes(1);
             let claims = serde_json::json!({
                 "sub": user_id.0.to_string(),
                 "session_id": session_id.0.to_string(),
