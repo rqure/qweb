@@ -10,7 +10,27 @@ use crossbeam::channel;
 use crate::store_service::StoreHandle;
 use crate::AppState;
 
-use qlib_rs::{auth::AuthorizationScope};
+use qlib_rs::{auth::AuthorizationScope, EntityId};
+
+/// Check session ownership for websocket connections
+async fn check_websocket_session_ownership(
+    handle: &StoreHandle,
+    session_id: EntityId,
+    qweb_service_id: EntityId,
+) -> Result<bool, String> {
+    let parent_field_type = handle.get_field_type("Parent").await
+        .map_err(|e| format!("Failed to get Parent field type: {:?}", e))?;
+    
+    // Check if session belongs to this qweb instance
+    let (parent_value, _, _) = handle.read(session_id, &[parent_field_type]).await
+        .map_err(|e| format!("Failed to read session parent: {:?}", e))?;
+    
+    if let qlib_rs::Value::EntityReference(Some(parent_id)) = parent_value {
+        Ok(parent_id == qweb_service_id)
+    } else {
+        Err("Session has no parent".to_string())
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NotifyConfigJson {
@@ -80,8 +100,21 @@ pub async fn ws_handler(
 
     let handle = state.store_handle.clone();
 
-    let (subject_id, session_id) = match crate::handlers::get_subject_and_session_from_request(&req, &state.jwt_secret, &handle).await {
-        Ok((uid, sid)) => (Some(uid), Some(sid)),
+    let (subject_id, ws_session_id) = match crate::handlers::get_subject_and_session_from_request(&req, &state.jwt_secret, &handle).await {
+        Ok((uid, sid)) => {
+            // Verify session ownership
+            match check_websocket_session_ownership(&handle, sid, state.qweb_service_id).await {
+                Ok(true) => (Some(uid), Some(sid)),
+                Ok(false) => {
+                    error!("Session belongs to different qweb instance");
+                    (None, None)
+                }
+                Err(e) => {
+                    error!("Failed to verify session ownership: {}", e);
+                    (None, None)
+                }
+            }
+        }
         Err(_) => (None, None),
     };
 
@@ -133,7 +166,7 @@ pub async fn ws_handler(
             Message::Text(text) => {
                 let response = match serde_json::from_str::<WsRequest>(&text) {
                     Ok(request) => {
-                        handle_ws_request(request, &handle, &crossbeam_sender, &mut registered_configs, subject_id, session_id).await
+                        handle_ws_request(request, &handle, &crossbeam_sender, &mut registered_configs, subject_id, ws_session_id).await
                     }
                     Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
                 };
@@ -164,7 +197,7 @@ pub async fn ws_handler(
     }
 
     // Auto-logout: Clear session on disconnect
-    if let Some(ws_session_id) = session_id {
+    if let Some(ws_session_id) = ws_session_id {
         info!("WebSocket disconnected, auto-logging out session: {:?}", ws_session_id);
         
         // Get field types

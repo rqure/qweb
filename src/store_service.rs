@@ -112,6 +112,9 @@ pub enum StoreCommand {
         commands: Vec<crate::models::PipelineCommand>,
         respond_to: oneshot::Sender<Result<Vec<crate::models::PipelineResult>>>,
     },
+    MachineInfo {
+        respond_to: oneshot::Sender<Result<String>>,
+    },
 }
 
 /// Handle for communicating with the StoreService
@@ -433,6 +436,17 @@ impl StoreHandle {
         rx.await
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
     }
+
+    pub async fn machine_info(&self) -> Result<String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::MachineInfo {
+                respond_to: tx,
+            })
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
+    }
 }
 
 /// Create permission cache
@@ -689,6 +703,10 @@ impl StoreService {
             }
             StoreCommand::ExecutePipeline { commands, respond_to } => {
                 let result = self.execute_pipeline_commands(commands);
+                let _ = respond_to.send(result);
+            }
+            StoreCommand::MachineInfo { respond_to } => {
+                let result = self.proxy.machine_info();
                 let _ = respond_to.send(result);
             }
         }

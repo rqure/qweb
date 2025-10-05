@@ -1,6 +1,6 @@
 use actix_web::{web, App, HttpServer};
 use log::{error, info};
-use qlib_rs::StoreProxy;
+use qlib_rs::{StoreProxy, EntityId};
 
 mod handlers;
 mod models;
@@ -13,6 +13,34 @@ use store_service::{StoreHandle, StoreService};
 pub struct AppState {
     store_handle: StoreHandle,
     jwt_secret: String,
+    qweb_service_id: EntityId,
+}
+
+async fn determine_qweb_service_id(handle: &StoreHandle) -> Result<EntityId, String> {
+    // Get machine name from machine_info
+    let machine_name = handle.machine_info().await
+        .map_err(|e| format!("Failed to get machine info: {:?}", e))?;
+    
+    info!("Machine name: {}", machine_name);
+    
+    // Get Service entity type
+    let service_entity_type = handle.get_entity_type("Service").await
+        .map_err(|e| format!("Failed to get Service entity type: {:?}", e))?;
+    
+    // Find qweb Service under the machine with the matching name using CEL filter
+    let filter = format!("Name == \"qweb\" && Parent->Name == \"{}\"", machine_name);
+    let services = handle.find_entities(service_entity_type, Some(&filter)).await
+        .map_err(|e| format!("Failed to find qweb Service: {:?}", e))?;
+    
+    if services.is_empty() {
+        return Err(format!("Could not find qweb service under machine '{}'", machine_name));
+    }
+    
+    if services.len() > 1 {
+        return Err(format!("Found multiple qweb services under machine '{}' - this should not happen", machine_name));
+    }
+    
+    Ok(services[0])
 }
 
 #[actix_web::main]
@@ -52,12 +80,30 @@ async fn main() -> std::io::Result<()> {
         store_service.run().await;
     });
 
-    let app_state = web::Data::new(AppState { store_handle: store_handle.clone(), jwt_secret });
+    // Determine which qweb service instance we are
+    let qweb_service_id = match determine_qweb_service_id(&store_handle).await {
+        Ok(id) => {
+            info!("Determined qweb service ID: {:?}", id);
+            id
+        }
+        Err(e) => {
+            error!("Failed to determine qweb service ID: {:?}", e);
+            return Err(std::io::Error::other(
+                format!("Failed to determine qweb service ID: {:?}", e),
+            ));
+        }
+    };
+
+    let app_state = web::Data::new(AppState { 
+        store_handle: store_handle.clone(), 
+        jwt_secret,
+        qweb_service_id,
+    });
 
         // Start session cleanup task
     let cleanup_handle = store_handle.clone();
     tokio::spawn(async move {
-        session_cleanup::session_cleanup_task(cleanup_handle).await;
+        session_cleanup::session_cleanup_task(cleanup_handle, qweb_service_id).await;
     });
 
     let bind_address = std::env::var("BIND_ADDRESS")

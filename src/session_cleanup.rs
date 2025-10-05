@@ -1,5 +1,5 @@
 use log::{error, info};
-use qlib_rs::{NotifyConfig, Value};
+use qlib_rs::{EntityId, NotifyConfig, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 use crossbeam::channel;
@@ -7,8 +7,9 @@ use crossbeam::channel;
 use crate::store_service::StoreHandle;
 
 /// Periodic task to clean up expired sessions using notifications
-pub async fn session_cleanup_task(handle: StoreHandle) {
-    info!("Starting session cleanup task");
+/// Only processes sessions owned by this qweb instance
+pub async fn session_cleanup_task(handle: StoreHandle, qweb_service_id: EntityId) {
+    info!("Starting session cleanup task for qweb instance: {:?}", qweb_service_id);
     
     // Get field types
     let session_entity_type = match handle.get_entity_type("Session").await {
@@ -51,12 +52,20 @@ pub async fn session_cleanup_task(handle: StoreHandle) {
         }
     };
     
-    // Track session expiration times
+    let parent_ft = match handle.get_field_type("Parent").await {
+        Ok(ft) => ft,
+        Err(e) => {
+            error!("Failed to get Parent field type: {:?}", e);
+            return;
+        }
+    };
+    
+    // Track session expiration times for sessions owned by this qweb instance
     // Map: session_id -> (expiration_timestamp, current_user)
     let mut session_expirations: HashMap<qlib_rs::EntityId, (qlib_rs::Timestamp, Option<qlib_rs::EntityId>)> = HashMap::new();
     
     // Register for ExpiresAt field notifications on all Session entities
-    // We'll include CurrentUser in the context to track who's using the session
+    // We'll include CurrentUser and Parent in the context to track who's using the session and filter by ownership
     let (notification_sender, notification_receiver) = channel::unbounded::<qlib_rs::Notification>();
     let notify_config = NotifyConfig::EntityType {
         entity_type: session_entity_type,
@@ -64,6 +73,7 @@ pub async fn session_cleanup_task(handle: StoreHandle) {
         trigger_on_change: true,
         context: vec![
             vec![current_user_ft],
+            vec![parent_ft],
         ],
     };
     
@@ -74,8 +84,9 @@ pub async fn session_cleanup_task(handle: StoreHandle) {
     
     info!("Session cleanup task registered for notifications");
     
-    // Initial load: read all sessions and their expiration times
-    let sessions = match handle.find_entities(session_entity_type, None).await {
+    // Initial load: read sessions owned by this qweb instance and their expiration times
+    let filter = format!("Parent == \"{}\"", qweb_service_id.0);
+    let sessions = match handle.find_entities(session_entity_type, Some(&filter)).await {
         Ok(entities) => entities,
         Err(e) => {
             error!("Failed to find Sessions for initial load: {:?}", e);
@@ -106,6 +117,23 @@ pub async fn session_cleanup_task(handle: StoreHandle) {
         // Process all pending notifications to update our expiration tracking
         while let Ok(notification) = notification_receiver.try_recv() {
             let session_id = notification.current.entity_id;
+            
+            // Extract Parent from context to check if this session belongs to this qweb instance
+            let session_parent = notification.context.get(&vec![parent_ft])
+                .and_then(|info| {
+                    if let Some(Value::EntityReference(parent)) = &info.value {
+                        *parent
+                    } else {
+                        None
+                    }
+                });
+            
+            // Only process sessions owned by this qweb instance
+            if session_parent != Some(qweb_service_id) {
+                // Remove from tracking if it was previously owned by us (ownership transferred)
+                session_expirations.remove(&session_id);
+                continue;
+            }
             
             // Extract ExpiresAt from the notification
             if let Some(Value::Timestamp(expires_at)) = &notification.current.value {

@@ -26,12 +26,6 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
         Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Session entity type: {:?}", e))),
     };
 
-    // Find all Session entities
-    let sessions = match handle.find_entities(session_entity_type, None).await {
-        Ok(entities) => entities,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to find Sessions: {:?}", e))),
-    };
-
     // Get field types
     let current_user_field_type = match handle.get_field_type("CurrentUser").await {
         Ok(ft) => ft,
@@ -58,24 +52,17 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
         Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get CreatedAt field type: {:?}", e))),
     };
 
-    // Find an available Session (CurrentUser field is None)
-    // TODO: Filter to only sessions owned by this qweb service instance (check Parent field)
-    let mut available_session = None;
-    for session_id in sessions {
-        match handle.read(session_id, &[current_user_field_type]).await {
-            Ok((value, _, _)) => {
-                if let qlib_rs::Value::EntityReference(None) = value {
-                    available_session = Some(session_id);
-                    break;
-                }
-            }
-            Err(_) => continue,
-        }
-    }
+    // Find an available Session owned by this qweb instance (CurrentUser field is None and Parent matches this qweb service)
+    let filter = format!("CurrentUser == null && Parent == \"{}\"", state.qweb_service_id.0);
+    let available_sessions = match handle.find_entities(session_entity_type, Some(&filter)).await {
+        Ok(entities) => entities,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to find available sessions: {:?}", e))),
+    };
 
-    let session_id = match available_session {
-        Some(id) => id,
-        None => return HttpResponse::ServiceUnavailable().json(ApiResponse::<()>::error("No available sessions. Maximum concurrent users reached.".to_string())),
+    let session_id = if let Some(&id) = available_sessions.first() {
+        id
+    } else {
+        return HttpResponse::ServiceUnavailable().json(ApiResponse::<()>::error("No available sessions. Maximum concurrent users reached.".to_string()))
     };
 
     // Store PreviousUser before assigning new user
@@ -209,6 +196,28 @@ pub async fn refresh(req: HttpRequest, state: web::Data<AppState>, _body: web::J
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Invalid token: {}", e))),
     };
 
+    // Verify this qweb instance owns the session
+    let parent_field_type = match handle.get_field_type("Parent").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Parent field type: {:?}", e))),
+    };
+
+    match check_session_ownership(handle, session_id, state.qweb_service_id, parent_field_type).await {
+        Ok(true) => {}, // Session is owned by this instance
+        Ok(false) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error("Session belongs to different qweb instance".to_string())),
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to verify session ownership: {}", e))),
+    }
+
+    let token_field_type = match handle.get_field_type("Token").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Token field type: {:?}", e))),
+    };
+
+    let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
+    };
+
     // Issue a new token with extended expiration (1 minute)
     use jsonwebtoken::{encode, Header, EncodingKey};
     let expiration = chrono::Utc::now() + chrono::Duration::minutes(1);
@@ -224,16 +233,6 @@ pub async fn refresh(req: HttpRequest, state: web::Data<AppState>, _body: web::J
     };
 
     // Update Session with new token and expiration
-    let token_field_type = match handle.get_field_type("Token").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Token field type: {:?}", e))),
-    };
-
-    let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
-    };
-
     if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), None, None, None, None).await {
         return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to update token: {:?}", e)));
     }
@@ -724,6 +723,26 @@ pub async fn pipeline(req: HttpRequest, state: web::Data<AppState>, body: web::J
     match handle.execute_pipeline(body.commands.clone()).await {
         Ok(results) => HttpResponse::Ok().json(crate::models::ApiResponse::success(crate::models::PipelineResponse { results })),
         Err(e) => HttpResponse::InternalServerError().json(crate::models::ApiResponse::<()>::error(format!("{:?}", e))),
+    }
+}
+
+/// Check if a session belongs to this qweb instance
+/// Sessions always belong to their parent qweb service (never transfer Parent)
+/// Returns true if owned by this instance, false otherwise
+async fn check_session_ownership(
+    handle: &crate::store_service::StoreHandle,
+    session_id: EntityId,
+    qweb_service_id: EntityId,
+    parent_field_type: FieldType,
+) -> Result<bool, String> {
+    // Read the session's parent to check ownership
+    let (parent_value, _, _) = handle.read(session_id, &[parent_field_type]).await
+        .map_err(|e| format!("Failed to read session parent: {:?}", e))?;
+    
+    if let qlib_rs::Value::EntityReference(Some(parent_id)) = parent_value {
+        Ok(parent_id == qweb_service_id)
+    } else {
+        Err("Session has no parent".to_string())
     }
 }
 
