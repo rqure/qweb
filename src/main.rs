@@ -75,6 +75,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/entity_exists", web::post().to(handlers::entity_exists))
             .route("/api/field_exists", web::post().to(handlers::field_exists))
             .route("/api/resolve_indirection", web::post().to(handlers::resolve_indirection))
+            .route("/api/pipeline", web::post().to(handlers::pipeline))
             .route("/ws", web::get().to(websocket::ws_handler))
     })
     .bind(bind_address)?

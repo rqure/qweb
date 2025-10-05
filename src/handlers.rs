@@ -493,6 +493,22 @@ pub async fn resolve_indirection(req: HttpRequest, state: web::Data<AppState>, b
     }
 }
 
+pub async fn pipeline(req: HttpRequest, state: web::Data<AppState>, body: web::Json<crate::models::PipelineRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => {
+            return HttpResponse::Unauthorized().json(crate::models::ApiResponse::<()>::error(e));
+        }
+    };
+
+    match handle.execute_pipeline(body.commands.clone()).await {
+        Ok(results) => HttpResponse::Ok().json(crate::models::ApiResponse::success(crate::models::PipelineResponse { results })),
+        Err(e) => HttpResponse::InternalServerError().json(crate::models::ApiResponse::<()>::error(format!("{:?}", e))),
+    }
+}
+
 fn json_to_value(json: &serde_json::Value) -> Result<qlib_rs::Value, String> {
     match json {
         serde_json::Value::Null => Ok(qlib_rs::Value::EntityReference(None)),

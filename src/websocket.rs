@@ -39,6 +39,7 @@ enum WsRequest {
     EntityExists { entity_id: String },
     FieldExists { entity_type: String, field_type: String },
     ResolveIndirection { entity_id: String, fields: Vec<String> },
+    Pipeline { commands: Vec<crate::models::PipelineCommand> },
     Ping,
 }
 
@@ -175,6 +176,17 @@ async fn handle_ws_request(
 ) -> WsResponse {
     match request {
         WsRequest::Ping => WsResponse::success(serde_json::json!({ "message": "pong" })),
+        
+        WsRequest::Pipeline { commands } => {
+            match handle.execute_pipeline(commands).await {
+                Ok(results) => {
+                    WsResponse::success(serde_json::json!({
+                        "results": results
+                    }))
+                }
+                Err(e) => WsResponse::error(format!("{:?}", e)),
+            }
+        }
         
         WsRequest::Read { entity_id, fields } => {
 

@@ -108,6 +108,10 @@ pub enum StoreCommand {
         sender: Sender<Notification>,
         respond_to: oneshot::Sender<Result<()>>,
     },
+    ExecutePipeline {
+        commands: Vec<crate::models::PipelineCommand>,
+        respond_to: oneshot::Sender<Result<Vec<crate::models::PipelineResult>>>,
+    },
 }
 
 /// Handle for communicating with the StoreService
@@ -417,6 +421,18 @@ impl StoreHandle {
         rx.await
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
     }
+
+    pub async fn execute_pipeline(&self, commands: Vec<crate::models::PipelineCommand>) -> Result<Vec<crate::models::PipelineResult>> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::ExecutePipeline {
+                commands,
+                respond_to: tx,
+            })
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
+    }
 }
 
 /// Create permission cache
@@ -671,6 +687,257 @@ impl StoreService {
                 self.proxy.unregister_notification(&config, &sender);
                 let _ = respond_to.send(Ok(()));
             }
+            StoreCommand::ExecutePipeline { commands, respond_to } => {
+                let result = self.execute_pipeline_commands(commands);
+                let _ = respond_to.send(result);
+            }
         }
+    }
+
+    fn execute_pipeline_commands(&mut self, commands: Vec<crate::models::PipelineCommand>) -> Result<Vec<crate::models::PipelineResult>> {
+        use crate::models::{PipelineCommand, PipelineResult};
+        
+        let mut pipeline = self.proxy.pipeline();
+        let mut command_types = Vec::new();
+        
+        // Queue all commands
+        for cmd in commands {
+            match cmd {
+                PipelineCommand::Read { entity_id, fields } => {
+                    let entity_id = entity_id.parse::<u64>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
+                    let entity_id = EntityId(entity_id);
+                    
+                    let mut field_types = Vec::new();
+                    for field_name in &fields {
+                        let field_type = self.proxy.get_field_type(field_name)?;
+                        field_types.push(field_type);
+                    }
+                    
+                    pipeline.read(entity_id, &field_types)?;
+                    command_types.push("Read");
+                }
+                PipelineCommand::Write { entity_id, field, value } => {
+                    let entity_id = entity_id.parse::<u64>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
+                    let entity_id = EntityId(entity_id);
+                    
+                    let field_type = self.proxy.get_field_type(&field)?;
+                    let qlib_value = json_to_qlib_value(&value)
+                        .map_err(|e| qlib_rs::Error::StoreProxyError(e))?;
+                    
+                    pipeline.write(entity_id, &[field_type], qlib_value, None, None, None, None)?;
+                    command_types.push("Write");
+                }
+                PipelineCommand::Create { entity_type, name } => {
+                    let et = self.proxy.get_entity_type(&entity_type)?;
+                    pipeline.create_entity(et, None, &name)?;
+                    command_types.push("Create");
+                }
+                PipelineCommand::Delete { entity_id } => {
+                    let entity_id = entity_id.parse::<u64>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
+                    pipeline.delete_entity(EntityId(entity_id))?;
+                    command_types.push("Delete");
+                }
+                PipelineCommand::GetEntityType { name } => {
+                    pipeline.get_entity_type(&name)?;
+                    command_types.push("GetEntityType");
+                }
+                PipelineCommand::ResolveEntityType { entity_type } => {
+                    let et = entity_type.parse::<u32>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity type".to_string()))?;
+                    pipeline.resolve_entity_type(EntityType(et))?;
+                    command_types.push("ResolveEntityType");
+                }
+                PipelineCommand::GetFieldType { name } => {
+                    pipeline.get_field_type(&name)?;
+                    command_types.push("GetFieldType");
+                }
+                PipelineCommand::ResolveFieldType { field_type } => {
+                    let ft = field_type.parse::<u64>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid field type".to_string()))?;
+                    pipeline.resolve_field_type(FieldType(ft))?;
+                    command_types.push("ResolveFieldType");
+                }
+                PipelineCommand::EntityExists { entity_id } => {
+                    let entity_id = entity_id.parse::<u64>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
+                    pipeline.entity_exists(EntityId(entity_id))?;
+                    command_types.push("EntityExists");
+                }
+                PipelineCommand::FieldExists { entity_type, field_type } => {
+                    let et = entity_type.parse::<u32>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity type".to_string()))?;
+                    let ft = field_type.parse::<u64>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid field type".to_string()))?;
+                    pipeline.field_exists(EntityType(et), FieldType(ft))?;
+                    command_types.push("FieldExists");
+                }
+                PipelineCommand::FindEntities { entity_type, filter } => {
+                    let et = self.proxy.get_entity_type(&entity_type)?;
+                    pipeline.find_entities(et, filter.as_deref())?;
+                    command_types.push("FindEntities");
+                }
+                PipelineCommand::GetEntityTypes => {
+                    pipeline.get_entity_types()?;
+                    command_types.push("GetEntityTypes");
+                }
+                PipelineCommand::ResolveIndirection { entity_id, fields } => {
+                    let entity_id = entity_id.parse::<u64>()
+                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
+                    let entity_id = EntityId(entity_id);
+                    
+                    let mut field_types = Vec::new();
+                    for field_name in &fields {
+                        let field_type = self.proxy.get_field_type(field_name)?;
+                        field_types.push(field_type);
+                    }
+                    
+                    // Note: Pipeline doesn't have resolve_indirection yet, we need to handle this differently
+                    // For now, execute it immediately
+                    let result = self.proxy.resolve_indirection(entity_id, &field_types);
+                    return Ok(vec![match result {
+                        Ok((eid, ft)) => PipelineResult::ResolveIndirection {
+                            entity_id: eid.0.to_string(),
+                            field_type: ft.0.to_string(),
+                        },
+                        Err(e) => PipelineResult::Error { message: format!("{:?}", e) },
+                    }]);
+                }
+            }
+        }
+        
+        // Execute pipeline
+        let results = pipeline.execute()?;
+        
+        // Convert results to PipelineResult
+        let mut output = Vec::new();
+        for (i, cmd_type) in command_types.iter().enumerate() {
+            let result = match *cmd_type {
+                "Read" => {
+                    let (value, timestamp, writer_id): (Value, Timestamp, Option<EntityId>) = results.get(i)?;
+                    PipelineResult::Read {
+                        value: value_to_json_value(&value),
+                        timestamp: timestamp.to_string(),
+                        writer_id: writer_id.map(|id| id.0.to_string()),
+                    }
+                }
+                "Write" => {
+                    let _: () = results.get(i)?;
+                    PipelineResult::Write
+                }
+                "Create" => {
+                    let entity_id: EntityId = results.get(i)?;
+                    PipelineResult::Create {
+                        entity_id: entity_id.0.to_string(),
+                    }
+                }
+                "Delete" => {
+                    let _: () = results.get(i)?;
+                    PipelineResult::Delete
+                }
+                "GetEntityType" => {
+                    let entity_type: EntityType = results.get(i)?;
+                    PipelineResult::GetEntityType {
+                        entity_type: entity_type.0.to_string(),
+                    }
+                }
+                "ResolveEntityType" => {
+                    let name: String = results.get(i)?;
+                    PipelineResult::ResolveEntityType { name }
+                }
+                "GetFieldType" => {
+                    let field_type: FieldType = results.get(i)?;
+                    PipelineResult::GetFieldType {
+                        field_type: field_type.0.to_string(),
+                    }
+                }
+                "ResolveFieldType" => {
+                    let name: String = results.get(i)?;
+                    PipelineResult::ResolveFieldType { name }
+                }
+                "EntityExists" => {
+                    let exists: bool = results.get(i)?;
+                    PipelineResult::EntityExists { exists }
+                }
+                "FieldExists" => {
+                    let exists: bool = results.get(i)?;
+                    PipelineResult::FieldExists { exists }
+                }
+                "FindEntities" => {
+                    let entities: Vec<EntityId> = results.get(i)?;
+                    PipelineResult::FindEntities {
+                        entities: entities.iter().map(|e| e.0.to_string()).collect(),
+                    }
+                }
+                "GetEntityTypes" => {
+                    let entity_types: Vec<EntityType> = results.get(i)?;
+                    PipelineResult::GetEntityTypes {
+                        entity_types: entity_types.iter().map(|et| et.0.to_string()).collect(),
+                    }
+                }
+                _ => PipelineResult::Error { message: "Unknown command type".to_string() },
+            };
+            output.push(result);
+        }
+        
+        Ok(output)
+    }
+}
+
+fn json_to_qlib_value(json: &serde_json::Value) -> std::result::Result<Value, String> {
+    match json {
+        serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Int(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(Value::Float(f))
+            } else {
+                Err("Invalid number".to_string())
+            }
+        }
+        serde_json::Value::String(s) => {
+            if let Ok(id) = s.parse::<u64>() {
+                Ok(Value::EntityReference(Some(EntityId(id))))
+            } else {
+                Ok(Value::String(s.clone()))
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let entity_ids: std::result::Result<Vec<EntityId>, String> = arr.iter().map(|item| {
+                if let serde_json::Value::String(s) = item {
+                    s.parse::<u64>().map(EntityId).map_err(|e| e.to_string())
+                } else if let serde_json::Value::Number(n) = item {
+                    n.as_u64().map(EntityId).ok_or_else(|| "Invalid number".to_string())
+                } else {
+                    Err("Array must contain entity IDs".to_string())
+                }
+            }).collect();
+            Ok(Value::EntityList(entity_ids?))
+        }
+        serde_json::Value::Null => Ok(Value::EntityReference(None)),
+        _ => Err("Unsupported JSON type".to_string()),
+    }
+}
+
+fn value_to_json_value(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(i) => serde_json::Value::Number((*i).into()),
+        Value::Float(f) => serde_json::json!(f),
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::EntityReference(Some(id)) => serde_json::Value::String(id.0.to_string()),
+        Value::EntityReference(None) => serde_json::Value::Null,
+        Value::EntityList(list) => {
+            serde_json::Value::Array(list.iter().map(|id| serde_json::Value::String(id.0.to_string())).collect())
+        }
+        Value::Blob(b) => {
+            use base64::Engine;
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(b))
+        },
+        Value::Choice(c) => serde_json::Value::Number((*c).into()),
+        Value::Timestamp(t) => serde_json::Value::String(t.to_string()),
     }
 }
