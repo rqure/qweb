@@ -44,6 +44,11 @@ pub struct LoginResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct RefreshRequest {
+    // No body needed - token comes from Authorization header
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SchemaRequest {
     pub entity_type: String,
 }

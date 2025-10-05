@@ -6,7 +6,7 @@ use crate::models::{
     ApiResponse, CreateRequest, DeleteRequest, FindRequest, ReadRequest,
     SchemaRequest, CompleteSchemaRequest, WriteRequest, LoginRequest, LoginResponse,
     ResolveEntityTypeRequest, ResolveFieldTypeRequest, GetFieldSchemaRequest,
-    EntityExistsRequest, FieldExistsRequest, ResolveIndirectionRequest,
+    EntityExistsRequest, FieldExistsRequest, ResolveIndirectionRequest, RefreshRequest,
 };
 use crate::AppState;
 
@@ -25,6 +25,26 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
             HttpResponse::Ok().json(ApiResponse::success(LoginResponse { token }))
         }
         Err(e) => HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Authentication failed: {:?}", e))),
+    }
+}
+
+pub async fn refresh(req: HttpRequest, state: web::Data<AppState>, _body: web::Json<RefreshRequest>) -> impl Responder {
+    // Extract and validate the existing token
+    let entity_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Invalid token: {}", e))),
+    };
+
+    // Issue a new token with extended expiration
+    use jsonwebtoken::{encode, Header, EncodingKey};
+    let claims = serde_json::json!({
+        "sub": entity_id.0.to_string(),
+        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+    });
+    
+    match encode(&Header::default(), &claims, &EncodingKey::from_secret(state.jwt_secret.as_bytes())) {
+        Ok(token) => HttpResponse::Ok().json(ApiResponse::success(LoginResponse { token })),
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to generate token: {:?}", e))),
     }
 }
 

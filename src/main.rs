@@ -62,6 +62,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(app_state.clone())
             .route("/api/login", web::post().to(handlers::login))
+            .route("/api/refresh", web::post().to(handlers::refresh))
             .route("/api/read", web::post().to(handlers::read))
             .route("/api/write", web::post().to(handlers::write))
             .route("/api/create", web::post().to(handlers::create))

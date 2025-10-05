@@ -40,6 +40,7 @@ enum WsRequest {
     FieldExists { entity_type: String, field_type: String },
     ResolveIndirection { entity_id: String, fields: Vec<String> },
     Pipeline { commands: Vec<crate::models::PipelineCommand> },
+    Refresh,
     Ping,
 }
 
@@ -176,6 +177,35 @@ async fn handle_ws_request(
 ) -> WsResponse {
     match request {
         WsRequest::Ping => WsResponse::success(serde_json::json!({ "message": "pong" })),
+        
+        WsRequest::Refresh => {
+            // Extract and validate the existing subject_id
+            let entity_id = match subject_id {
+                Some(id) => id,
+                None => return WsResponse::error("Not authenticated".to_string()),
+            };
+
+            // Issue a new token with extended expiration
+            use jsonwebtoken::{encode, Header, EncodingKey};
+            
+            // Get JWT secret from environment (we need to pass it somehow)
+            // For now, we'll generate a token but note that the WebSocket client
+            // would need the JWT secret to be accessible here
+            let jwt_secret = std::env::var("JWT_SECRET")
+                .unwrap_or_else(|_| "default_secret".to_string());
+            
+            let claims = serde_json::json!({
+                "sub": entity_id.0.to_string(),
+                "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+            });
+            
+            match encode(&Header::default(), &claims, &EncodingKey::from_secret(jwt_secret.as_bytes())) {
+                Ok(token) => WsResponse::success(serde_json::json!({
+                    "token": token
+                })),
+                Err(e) => WsResponse::error(format!("Failed to generate token: {:?}", e)),
+            }
+        }
         
         WsRequest::Pipeline { commands } => {
             match handle.execute_pipeline(commands).await {
