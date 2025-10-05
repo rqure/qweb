@@ -80,9 +80,9 @@ pub async fn ws_handler(
 
     let handle = state.store_handle.clone();
 
-    let subject_id = match crate::handlers::get_subject_from_request(&req, &state.jwt_secret) {
-        Ok(id) => Some(id),
-        Err(_) => None,
+    let (subject_id, session_id) = match crate::handlers::get_subject_and_session_from_request(&req, &state.jwt_secret, &handle).await {
+        Ok((uid, sid)) => (Some(uid), Some(sid)),
+        Err(_) => (None, None),
     };
 
         // Create channels for notifications
@@ -133,7 +133,7 @@ pub async fn ws_handler(
             Message::Text(text) => {
                 let response = match serde_json::from_str::<WsRequest>(&text) {
                     Ok(request) => {
-                        handle_ws_request(request, &handle, &crossbeam_sender, &mut registered_configs, subject_id).await
+                        handle_ws_request(request, &handle, &crossbeam_sender, &mut registered_configs, subject_id, session_id).await
                     }
                     Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
                 };
@@ -174,37 +174,64 @@ async fn handle_ws_request(
     notification_sender: &channel::Sender<qlib_rs::Notification>,
     registered_configs: &mut HashMap<qlib_rs::NotifyConfig, ()>,
     subject_id: Option<qlib_rs::EntityId>,
+    session_id: Option<qlib_rs::EntityId>,
 ) -> WsResponse {
     match request {
         WsRequest::Ping => WsResponse::success(serde_json::json!({ "message": "pong" })),
         
         WsRequest::Refresh => {
-            // Extract and validate the existing subject_id
-            let entity_id = match subject_id {
+            // Extract and validate the existing subject_id and session_id
+            let user_id = match subject_id {
                 Some(id) => id,
                 None => return WsResponse::error("Not authenticated".to_string()),
+            };
+
+            let session_id = match session_id {
+                Some(id) => id,
+                None => return WsResponse::error("No session".to_string()),
             };
 
             // Issue a new token with extended expiration
             use jsonwebtoken::{encode, Header, EncodingKey};
             
-            // Get JWT secret from environment (we need to pass it somehow)
-            // For now, we'll generate a token but note that the WebSocket client
-            // would need the JWT secret to be accessible here
             let jwt_secret = std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "default_secret".to_string());
             
+            let expiration = chrono::Utc::now() + chrono::Duration::hours(1);
             let claims = serde_json::json!({
-                "sub": entity_id.0.to_string(),
-                "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+                "sub": user_id.0.to_string(),
+                "session_id": session_id.0.to_string(),
+                "exp": expiration.timestamp() as usize,
             });
             
-            match encode(&Header::default(), &claims, &EncodingKey::from_secret(jwt_secret.as_bytes())) {
-                Ok(token) => WsResponse::success(serde_json::json!({
-                    "token": token
-                })),
-                Err(e) => WsResponse::error(format!("Failed to generate token: {:?}", e)),
+            let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(jwt_secret.as_bytes())) {
+                Ok(t) => t,
+                Err(e) => return WsResponse::error(format!("Failed to generate token: {:?}", e)),
+            };
+
+            // Update Session with new token and expiration
+            let token_field_type = match handle.get_field_type("Token").await {
+                Ok(ft) => ft,
+                Err(e) => return WsResponse::error(format!("Failed to get Token field type: {:?}", e)),
+            };
+
+            let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
+                Ok(ft) => ft,
+                Err(e) => return WsResponse::error(format!("Failed to get ExpiresAt field type: {:?}", e)),
+            };
+
+            if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), None, None, None, None).await {
+                return WsResponse::error(format!("Failed to update token: {:?}", e));
             }
+
+            let expiration_timestamp = qlib_rs::millis_to_timestamp(expiration.timestamp_millis() as u64);
+            if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), None, None, None, None).await {
+                return WsResponse::error(format!("Failed to update expiration: {:?}", e));
+            }
+
+            WsResponse::success(serde_json::json!({
+                "token": token
+            }))
         }
         
         WsRequest::Pipeline { commands } => {

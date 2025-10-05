@@ -7,45 +7,193 @@ use crate::models::{
     SchemaRequest, CompleteSchemaRequest, WriteRequest, LoginRequest, LoginResponse,
     ResolveEntityTypeRequest, ResolveFieldTypeRequest, GetFieldSchemaRequest,
     EntityExistsRequest, FieldExistsRequest, ResolveIndirectionRequest, RefreshRequest,
+    LogoutRequest,
 };
 use crate::AppState;
 
 pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> impl Responder {
     let handle = &state.store_handle;
 
-    match handle.authenticate_user(&req.username, &req.password).await {
-        Ok(entity_id) => {
-            // Create JWT
-            use jsonwebtoken::{encode, Header, EncodingKey};
-            let claims = serde_json::json!({
-                "sub": entity_id.0.to_string(),
-                "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
-            });
-            let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(state.jwt_secret.as_bytes())).unwrap();
-            HttpResponse::Ok().json(ApiResponse::success(LoginResponse { token }))
+    // Authenticate the user
+    let user_id = match handle.authenticate_user(&req.username, &req.password).await {
+        Ok(entity_id) => entity_id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Authentication failed: {:?}", e))),
+    };
+
+    // Find Session entity type
+    let session_entity_type = match handle.get_entity_type("Session").await {
+        Ok(et) => et,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Session entity type: {:?}", e))),
+    };
+
+    // Find all Session entities
+    let sessions = match handle.find_entities(session_entity_type, None).await {
+        Ok(entities) => entities,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to find Sessions: {:?}", e))),
+    };
+
+    // Get User field type
+    let user_field_type = match handle.get_field_type("User").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get User field type: {:?}", e))),
+    };
+
+    let token_field_type = match handle.get_field_type("Token").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Token field type: {:?}", e))),
+    };
+
+    let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
+    };
+
+    let created_at_field_type = match handle.get_field_type("CreatedAt").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get CreatedAt field type: {:?}", e))),
+    };
+
+    // Find an available Session (User field is None)
+    let mut available_session = None;
+    for session_id in sessions {
+        match handle.read(session_id, &[user_field_type]).await {
+            Ok((value, _, _)) => {
+                if let qlib_rs::Value::EntityReference(None) = value {
+                    available_session = Some(session_id);
+                    break;
+                }
+            }
+            Err(_) => continue,
         }
-        Err(e) => HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Authentication failed: {:?}", e))),
     }
+
+    let session_id = match available_session {
+        Some(id) => id,
+        None => return HttpResponse::ServiceUnavailable().json(ApiResponse::<()>::error("No available sessions. Maximum concurrent users reached.".to_string())),
+    };
+
+    // Create JWT with session_id in claims
+    use jsonwebtoken::{encode, Header, EncodingKey};
+    let expiration = chrono::Utc::now() + chrono::Duration::hours(1);
+    let claims = serde_json::json!({
+        "sub": user_id.0.to_string(),
+        "session_id": session_id.0.to_string(),
+        "exp": expiration.timestamp() as usize,
+    });
+    let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(state.jwt_secret.as_bytes())) {
+        Ok(t) => t,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to generate token: {:?}", e))),
+    };
+
+    // Update Session entity with User reference, token, and timestamps
+    if let Err(e) = handle.write(session_id, &[user_field_type], qlib_rs::Value::EntityReference(Some(user_id)), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to assign user to session: {:?}", e)));
+    }
+
+    if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to store token: {:?}", e)));
+    }
+
+    let now = qlib_rs::epoch();
+    if let Err(e) = handle.write(session_id, &[created_at_field_type], qlib_rs::Value::Timestamp(now), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to store created timestamp: {:?}", e)));
+    }
+
+    let expiration_timestamp = qlib_rs::millis_to_timestamp(expiration.timestamp_millis() as u64);
+    if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to store expiration: {:?}", e)));
+    }
+
+    HttpResponse::Ok().json(ApiResponse::success(LoginResponse { token }))
+}
+
+pub async fn logout(req: HttpRequest, state: web::Data<AppState>, _body: web::Json<LogoutRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    // Extract session_id from token
+    let session_id = match get_session_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Invalid token: {}", e))),
+    };
+
+    // Get field types
+    let user_field_type = match handle.get_field_type("User").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get User field type: {:?}", e))),
+    };
+
+    let token_field_type = match handle.get_field_type("Token").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Token field type: {:?}", e))),
+    };
+
+    let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
+    };
+
+    // Clear the Session by setting User to None, clearing token and resetting expiration
+    if let Err(e) = handle.write(session_id, &[user_field_type], qlib_rs::Value::EntityReference(None), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to clear session user: {:?}", e)));
+    }
+
+    if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String("".to_string()), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to clear token: {:?}", e)));
+    }
+
+    if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(qlib_rs::epoch()), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to clear expiration: {:?}", e)));
+    }
+
+    HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+        "message": "Successfully logged out"
+    })))
 }
 
 pub async fn refresh(req: HttpRequest, state: web::Data<AppState>, _body: web::Json<RefreshRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
     // Extract and validate the existing token
-    let entity_id = match get_subject_from_request(&req, &state.jwt_secret) {
-        Ok(id) => id,
+    let (user_id, session_id) = match get_subject_and_session_from_request(&req, &state.jwt_secret, handle).await {
+        Ok((uid, sid)) => (uid, sid),
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Invalid token: {}", e))),
     };
 
     // Issue a new token with extended expiration
     use jsonwebtoken::{encode, Header, EncodingKey};
+    let expiration = chrono::Utc::now() + chrono::Duration::hours(1);
     let claims = serde_json::json!({
-        "sub": entity_id.0.to_string(),
-        "exp": (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize,
+        "sub": user_id.0.to_string(),
+        "session_id": session_id.0.to_string(),
+        "exp": expiration.timestamp() as usize,
     });
     
-    match encode(&Header::default(), &claims, &EncodingKey::from_secret(state.jwt_secret.as_bytes())) {
-        Ok(token) => HttpResponse::Ok().json(ApiResponse::success(LoginResponse { token })),
-        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to generate token: {:?}", e))),
+    let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(state.jwt_secret.as_bytes())) {
+        Ok(t) => t,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to generate token: {:?}", e))),
+    };
+
+    // Update Session with new token and expiration
+    let token_field_type = match handle.get_field_type("Token").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Token field type: {:?}", e))),
+    };
+
+    let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
+        Ok(ft) => ft,
+        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
+    };
+
+    if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to update token: {:?}", e)));
     }
+
+    let expiration_timestamp = qlib_rs::millis_to_timestamp(expiration.timestamp_millis() as u64);
+    if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), None, None, None, None).await {
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to update expiration: {:?}", e)));
+    }
+
+    HttpResponse::Ok().json(ApiResponse::success(LoginResponse { token }))
 }
 
 pub async fn read(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ReadRequest>) -> impl Responder {
@@ -582,4 +730,76 @@ pub fn get_subject_from_request(req: &HttpRequest, jwt_secret: &str) -> Result<E
     let entity_id = sub.parse::<u64>().map_err(|_| "Invalid sub")?;
 
     Ok(EntityId(entity_id))
+}
+
+pub fn get_session_from_request(req: &HttpRequest, jwt_secret: &str) -> Result<EntityId, String> {
+    let auth_header = req.headers().get("Authorization").ok_or("No Authorization header")?;
+
+    let auth_str = auth_header.to_str().map_err(|_| "Invalid header")?;
+
+    if !auth_str.starts_with("Bearer ") {
+        return Err("Invalid token format".into());
+    }
+
+    let token = &auth_str[7..];
+
+    use jsonwebtoken::{decode, Validation, DecodingKey};
+
+    let token_data = decode::<serde_json::Value>(&token, &DecodingKey::from_secret(jwt_secret.as_bytes()), &Validation::default()).map_err(|_| "Invalid token")?;
+
+    let session_id_str = token_data.claims["session_id"].as_str().ok_or("No session_id")?;
+
+    let session_id = session_id_str.parse::<u64>().map_err(|_| "Invalid session_id")?;
+
+    Ok(EntityId(session_id))
+}
+
+pub async fn get_subject_and_session_from_request(
+    req: &HttpRequest,
+    jwt_secret: &str,
+    handle: &crate::store_service::StoreHandle,
+) -> Result<(EntityId, EntityId), String> {
+    let auth_header = req.headers().get("Authorization").ok_or("No Authorization header")?;
+
+    let auth_str = auth_header.to_str().map_err(|_| "Invalid header")?;
+
+    if !auth_str.starts_with("Bearer ") {
+        return Err("Invalid token format".into());
+    }
+
+    let token = &auth_str[7..];
+
+    use jsonwebtoken::{decode, Validation, DecodingKey};
+
+    let token_data = decode::<serde_json::Value>(&token, &DecodingKey::from_secret(jwt_secret.as_bytes()), &Validation::default()).map_err(|_| "Invalid token")?;
+
+    let sub = token_data.claims["sub"].as_str().ok_or("No sub")?;
+    let session_id_str = token_data.claims["session_id"].as_str().ok_or("No session_id")?;
+
+    let user_id = EntityId(sub.parse::<u64>().map_err(|_| "Invalid sub")?);
+    let session_id = EntityId(session_id_str.parse::<u64>().map_err(|_| "Invalid session_id")?);
+
+    // Verify the Session is still valid
+    let user_field_type = handle.get_field_type("User").await.map_err(|e| format!("Failed to get User field type: {:?}", e))?;
+    let expires_at_field_type = handle.get_field_type("ExpiresAt").await.map_err(|e| format!("Failed to get ExpiresAt field type: {:?}", e))?;
+
+    // Check that the Session still has the User assigned
+    let (user_value, _, _) = handle.read(session_id, &[user_field_type]).await.map_err(|e| format!("Failed to read session: {:?}", e))?;
+    match user_value {
+        qlib_rs::Value::EntityReference(Some(stored_user_id)) if stored_user_id == user_id => {},
+        _ => return Err("Session is no longer valid".to_string()),
+    }
+
+    // Check that the Session hasn't expired
+    let (expires_value, _, _) = handle.read(session_id, &[expires_at_field_type]).await.map_err(|e| format!("Failed to read expiration: {:?}", e))?;
+    if let qlib_rs::Value::Timestamp(expires_at) = expires_value {
+        let now = qlib_rs::now();
+        if now > expires_at {
+            return Err("Session has expired".to_string());
+        }
+    } else {
+        return Err("Invalid expiration value".to_string());
+    }
+
+    Ok((user_id, session_id))
 }
