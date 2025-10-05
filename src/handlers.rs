@@ -53,11 +53,33 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
     };
 
     // Find an available Session owned by this qweb instance (CurrentUser field is None and Parent matches this qweb service)
-    let filter = format!("CurrentUser == null && Parent == \"{}\"", state.qweb_service_id.0);
+    let filter = format!("CurrentUser == null && Parent == {}", state.qweb_service_id.0);
     let available_sessions = match handle.find_entities(session_entity_type, Some(&filter)).await {
         Ok(entities) => entities,
         Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to find available sessions: {:?}", e))),
     };
+
+    // If no sessions found with Parent filter, try without to debug
+    let available_sessions = if available_sessions.is_empty() {
+        log::warn!("No sessions found with Parent filter, trying without Parent filter");
+        match handle.find_entities(session_entity_type, Some("CurrentUser == null")).await {
+            Ok(entities) => {
+                log::info!("Found {} sessions without Parent filter", entities.len());
+                entities
+            }
+            Err(e) => {
+                log::error!("Failed to find sessions without Parent filter: {:?}", e);
+                Vec::new()
+            }
+        }
+    } else {
+        available_sessions
+    };
+
+    log::info!("Login attempt - qweb_service_id: {:?}, filter: '{}', found {} sessions", state.qweb_service_id, filter, available_sessions.len());
+    if !available_sessions.is_empty() {
+        log::info!("Available session IDs: {:?}", available_sessions.iter().map(|id| id.0).collect::<Vec<_>>());
+    }
 
     let session_id = if let Some(&id) = available_sessions.first() {
         id
