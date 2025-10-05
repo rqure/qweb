@@ -1,4 +1,5 @@
 use actix_web::{web, App, HttpServer};
+use actix_cors::Cors;
 use log::{error, info};
 use qlib_rs::{StoreProxy, EntityId};
 
@@ -111,8 +112,40 @@ async fn main() -> std::io::Result<()> {
 
     info!("Binding web server to: {}", bind_address);
 
+    // Get CORS allowed origins from environment variable
+    let cors_origins = std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:5173,http://localhost:3000".to_string());
+    
+    info!("CORS allowed origins: {}", cors_origins);
+    
+    // Parse origins into a Vec that can be moved into the closure
+    let allowed_origins: Vec<String> = cors_origins
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
     HttpServer::new(move || {
+        // Clone allowed origins for this instance of the app
+        let origins = allowed_origins.clone();
+        
+        // Configure CORS
+        let mut cors = Cors::default()
+            .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+            .allowed_headers(vec![
+                actix_web::http::header::AUTHORIZATION,
+                actix_web::http::header::ACCEPT,
+                actix_web::http::header::CONTENT_TYPE,
+            ])
+            .supports_credentials()
+            .max_age(3600);
+        
+        // Add each allowed origin
+        for origin in &origins {
+            cors = cors.allowed_origin(origin);
+        }
+
         App::new()
+            .wrap(cors)
             .app_data(app_state.clone())
             .route("/api/login", web::post().to(handlers::login))
             .route("/api/logout", web::post().to(handlers::logout))

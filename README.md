@@ -32,9 +32,27 @@ QCORE_ADDRESS=192.168.1.100:8080 BIND_ADDRESS=0.0.0.0:8000 cargo run
 
 Configure the application using environment variables:
 
-- `QCORE_ADDRESS` - Address of the qcore-rs server (default: `127.0.0.1:8080`)
+- `QCORE_ADDRESS` - Address of the qcore-rs server (default: `127.0.0.1:9100`)
 - `BIND_ADDRESS` - Address to bind the web server (default: `0.0.0.0:3000`)
+- `CORS_ALLOWED_ORIGINS` - Comma-separated list of allowed CORS origins (default: `http://localhost:5173,http://localhost:3000`)
+- `JWT_SECRET` - Secret key for JWT token signing (default: `default_secret`)
 - `RUST_LOG` - Log level (e.g., `info`, `debug`, `trace`)
+
+#### CORS Configuration
+
+CORS is enabled by default to allow cross-origin requests from the frontend. For development, the default origins are:
+- `http://localhost:5173` (Vite dev server)
+- `http://localhost:3000` (qweb itself)
+
+For production, specify only your production frontend URL:
+```bash
+CORS_ALLOWED_ORIGINS="https://yourdomain.com" cargo run --release
+```
+
+For multiple origins:
+```bash
+CORS_ALLOWED_ORIGINS="http://localhost:5173,https://staging.example.com,https://example.com" cargo run --release
+```
 
 ## HTTP API
 
