@@ -847,10 +847,10 @@ impl StoreService {
                         Ok((eid, ft)) => PipelineResult::ResolveIndirection {
                             entity_id: EntityIdModel { id: eid.0.to_string(), entity_type: {
                                 let et = eid.extract_type();
-                                let name = self.proxy.resolve_entity_type(et).ok();
+                                let name = self.proxy.resolve_entity_type(et).unwrap_or_default();
                                 EntityTypeModel { id: et.0.to_string(), name }
                             }},
-                            field_type: FieldTypeModel { id: ft.0.to_string(), name: self.proxy.resolve_field_type(ft).ok() },
+                            field_type: FieldTypeModel { id: ft.0.to_string(), name: self.proxy.resolve_field_type(ft).unwrap_or_default() },
                         },
                         Err(e) => PipelineResult::Error { message: format!("{:?}", e) },
                     }]);
@@ -869,7 +869,7 @@ impl StoreService {
                     let (value, timestamp, writer_id): (Value, Timestamp, Option<EntityId>) = results.get(i)?;
                     let writer_model = writer_id.map(|wid| {
                         let et = wid.extract_type();
-                        let et_name = self.proxy.resolve_entity_type(et).ok();
+                        let et_name = self.proxy.resolve_entity_type(et).unwrap_or_default();
                         EntityIdModel { id: wid.0.to_string(), entity_type: EntityTypeModel { id: et.0.to_string(), name: et_name } }
                     });
                     PipelineResult::Read {
@@ -885,7 +885,7 @@ impl StoreService {
                 "Create" => {
                     let entity_id: EntityId = results.get(i)?;
                     let et = entity_id.extract_type();
-                    let et_name = self.proxy.resolve_entity_type(et).ok();
+                    let et_name = self.proxy.resolve_entity_type(et).unwrap_or_default();
                     PipelineResult::Create {
                         entity_id: EntityIdModel { id: entity_id.0.to_string(), entity_type: EntityTypeModel { id: et.0.to_string(), name: et_name } },
                     }
@@ -896,23 +896,23 @@ impl StoreService {
                 }
                 "GetEntityType" => {
                     let entity_type: EntityType = results.get(i)?;
-                    let name = self.proxy.resolve_entity_type(entity_type).ok();
+                    let name = self.proxy.resolve_entity_type(entity_type).unwrap_or_default();
                     PipelineResult::GetEntityType { entity_type: EntityTypeModel { id: entity_type.0.to_string(), name } }
                 }
                 "ResolveEntityType" => {
                     let name: String = results.get(i)?;
                     let id_str = meta.clone().unwrap_or_else(|| "".to_string());
-                    PipelineResult::ResolveEntityType { entity_type: EntityTypeModel { id: id_str, name: Some(name) } }
+                    PipelineResult::ResolveEntityType { entity_type: EntityTypeModel { id: id_str, name } }
                 }
                 "GetFieldType" => {
                     let field_type: FieldType = results.get(i)?;
-                    let name = self.proxy.resolve_field_type(field_type).ok();
+                    let name = self.proxy.resolve_field_type(field_type).unwrap_or_default();
                     PipelineResult::GetFieldType { field_type: FieldTypeModel { id: field_type.0.to_string(), name } }
                 }
                 "ResolveFieldType" => {
                     let name: String = results.get(i)?;
                     let id_str = meta.clone().unwrap_or_else(|| "".to_string());
-                    PipelineResult::ResolveFieldType { field_type: FieldTypeModel { id: id_str, name: Some(name) } }
+                    PipelineResult::ResolveFieldType { field_type: FieldTypeModel { id: id_str, name } }
                 }
                 "EntityExists" => {
                     let exists: bool = results.get(i)?;
@@ -927,7 +927,7 @@ impl StoreService {
                         let mut models = Vec::new();
                     for e in entities.iter() {
                         let et = e.extract_type();
-                        let et_name = self.proxy.resolve_entity_type(et).ok();
+                        let et_name = self.proxy.resolve_entity_type(et).unwrap_or_default();
                         models.push(EntityIdModel { id: e.0.to_string(), entity_type: EntityTypeModel { id: et.0.to_string(), name: et_name } });
                     }
                     PipelineResult::FindEntities { entities: models }
@@ -936,7 +936,7 @@ impl StoreService {
                     let entity_types: Vec<EntityType> = results.get(i)?;
                     let mut out = Vec::new();
                     for et in entity_types.iter() {
-                        let name = self.proxy.resolve_entity_type(*et).ok();
+                        let name = self.proxy.resolve_entity_type(*et).unwrap_or_default();
                         out.push(EntityTypeModel { id: et.0.to_string(), name });
                     }
                     PipelineResult::GetEntityTypes { entity_types: out }
