@@ -728,132 +728,154 @@ impl StoreService {
     }
 
     fn execute_pipeline_commands(&mut self, commands: Vec<crate::models::PipelineCommand>) -> Result<Vec<crate::models::PipelineResult>> {
-        use crate::models::{PipelineCommand, PipelineResult};
-        
+        use crate::models::{PipelineCommand, PipelineResult, EntityIdModel, EntityTypeModel, FieldTypeModel};
+
         let mut pipeline = self.proxy.pipeline();
-        let mut command_types = Vec::new();
-        
+        // store tuple of (command type, optional id metadata)
+        let mut command_types: Vec<(&str, Option<String>)> = Vec::new();
+
+        // Helper parsers for incoming model types
+        fn parse_entity_id(model: EntityIdModel) -> std::result::Result<EntityId, qlib_rs::Error> {
+            let id = model.id.parse::<u64>().map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
+            Ok(EntityId(id))
+        }
+
+        fn parse_entity_type(model: EntityTypeModel, proxy: &StoreProxy) -> std::result::Result<EntityType, qlib_rs::Error> {
+            let id_str = model.id;
+            if let Ok(v) = id_str.parse::<u32>() {
+                Ok(EntityType(v))
+            } else {
+                proxy.get_entity_type(&id_str)
+            }
+        }
+
+        fn parse_field_type(model: FieldTypeModel, proxy: &StoreProxy) -> std::result::Result<FieldType, qlib_rs::Error> {
+            let id_str = model.id;
+            if let Ok(v) = id_str.parse::<u64>() {
+                Ok(FieldType(v))
+            } else {
+                proxy.get_field_type(&id_str)
+            }
+        }
+
         // Queue all commands
         for cmd in commands {
             match cmd {
                 PipelineCommand::Read { entity_id, fields } => {
-                    let entity_id = entity_id.parse::<u64>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
-                    let entity_id = EntityId(entity_id);
-                    
+                    let eid = parse_entity_id(entity_id)?;
+
                     let mut field_types = Vec::new();
                     for field_name in &fields {
-                        let field_type = self.proxy.get_field_type(field_name)?;
-                        field_types.push(field_type);
+                        let ft = self.proxy.get_field_type(field_name)?;
+                        field_types.push(ft);
                     }
-                    
-                    pipeline.read(entity_id, &field_types)?;
-                    command_types.push("Read");
+
+                    pipeline.read(eid, &field_types)?;
+                    command_types.push(("Read", None));
                 }
                 PipelineCommand::Write { entity_id, field, value } => {
-                    let entity_id = entity_id.parse::<u64>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
-                    let entity_id = EntityId(entity_id);
-                    
-                    let field_type = self.proxy.get_field_type(&field)?;
-                    let qlib_value = json_to_qlib_value(&value)
-                        .map_err(|e| qlib_rs::Error::StoreProxyError(e))?;
-                    
-                    pipeline.write(entity_id, &[field_type], qlib_value, None, None, None, None)?;
-                    command_types.push("Write");
+                    let eid = parse_entity_id(entity_id)?;
+                    let field_type = parse_field_type(field, &self.proxy)?;
+                    let qlib_value = json_to_qlib_value(&value).map_err(|e| qlib_rs::Error::StoreProxyError(e))?;
+
+                    pipeline.write(eid, &[field_type], qlib_value, None, None, None, None)?;
+                    command_types.push(("Write", None));
                 }
                 PipelineCommand::Create { entity_type, name } => {
-                    let et = self.proxy.get_entity_type(&entity_type)?;
+                    let et = parse_entity_type(entity_type, &self.proxy)?;
                     pipeline.create_entity(et, None, &name)?;
-                    command_types.push("Create");
+                    command_types.push(("Create", None));
                 }
                 PipelineCommand::Delete { entity_id } => {
-                    let entity_id = entity_id.parse::<u64>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
-                    pipeline.delete_entity(EntityId(entity_id))?;
-                    command_types.push("Delete");
+                    let eid = parse_entity_id(entity_id)?;
+                    pipeline.delete_entity(eid)?;
+                    command_types.push(("Delete", None));
                 }
                 PipelineCommand::GetEntityType { name } => {
                     pipeline.get_entity_type(&name)?;
-                    command_types.push("GetEntityType");
+                    command_types.push(("GetEntityType", None));
                 }
                 PipelineCommand::ResolveEntityType { entity_type } => {
-                    let et = entity_type.parse::<u32>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity type".to_string()))?;
-                    pipeline.resolve_entity_type(EntityType(et))?;
-                    command_types.push("ResolveEntityType");
+                    // capture the id metadata so we can return structured {id, name}
+                    let id_meta = Some(entity_type.id.clone());
+                    let et = parse_entity_type(entity_type, &self.proxy)?;
+                    pipeline.resolve_entity_type(et)?;
+                    command_types.push(("ResolveEntityType", id_meta));
                 }
                 PipelineCommand::GetFieldType { name } => {
                     pipeline.get_field_type(&name)?;
-                    command_types.push("GetFieldType");
+                    command_types.push(("GetFieldType", None));
                 }
                 PipelineCommand::ResolveFieldType { field_type } => {
-                    let ft = field_type.parse::<u64>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid field type".to_string()))?;
-                    pipeline.resolve_field_type(FieldType(ft))?;
-                    command_types.push("ResolveFieldType");
+                    let id_meta = Some(field_type.id.clone());
+                    let ft = parse_field_type(field_type, &self.proxy)?;
+                    pipeline.resolve_field_type(ft)?;
+                    command_types.push(("ResolveFieldType", id_meta));
                 }
                 PipelineCommand::EntityExists { entity_id } => {
-                    let entity_id = entity_id.parse::<u64>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
-                    pipeline.entity_exists(EntityId(entity_id))?;
-                    command_types.push("EntityExists");
+                    let eid = parse_entity_id(entity_id)?;
+                    pipeline.entity_exists(eid)?;
+                    command_types.push(("EntityExists", None));
                 }
                 PipelineCommand::FieldExists { entity_type, field_type } => {
-                    let et = entity_type.parse::<u32>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity type".to_string()))?;
-                    let ft = field_type.parse::<u64>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid field type".to_string()))?;
-                    pipeline.field_exists(EntityType(et), FieldType(ft))?;
-                    command_types.push("FieldExists");
+                    let et = parse_entity_type(entity_type, &self.proxy)?;
+                    let ft = parse_field_type(field_type, &self.proxy)?;
+                    pipeline.field_exists(et, ft)?;
+                    command_types.push(("FieldExists", None));
                 }
                 PipelineCommand::FindEntities { entity_type, filter } => {
-                    let et = self.proxy.get_entity_type(&entity_type)?;
+                    let et = parse_entity_type(entity_type, &self.proxy)?;
                     pipeline.find_entities(et, filter.as_deref())?;
-                    command_types.push("FindEntities");
+                    command_types.push(("FindEntities", None));
                 }
                 PipelineCommand::GetEntityTypes => {
                     pipeline.get_entity_types()?;
-                    command_types.push("GetEntityTypes");
+                    command_types.push(("GetEntityTypes", None));
                 }
                 PipelineCommand::ResolveIndirection { entity_id, fields } => {
-                    let entity_id = entity_id.parse::<u64>()
-                        .map_err(|_| qlib_rs::Error::StoreProxyError("Invalid entity ID".to_string()))?;
-                    let entity_id = EntityId(entity_id);
-                    
+                    let eid = parse_entity_id(entity_id)?;
+
                     let mut field_types = Vec::new();
                     for field_name in &fields {
-                        let field_type = self.proxy.get_field_type(field_name)?;
-                        field_types.push(field_type);
+                        let ft = self.proxy.get_field_type(field_name)?;
+                        field_types.push(ft);
                     }
-                    
-                    // Note: Pipeline doesn't have resolve_indirection yet, we need to handle this differently
-                    // For now, execute it immediately
-                    let result = self.proxy.resolve_indirection(entity_id, &field_types);
+
+                    // Pipeline doesn't support resolve_indirection, run it immediately and return
+                    let result = self.proxy.resolve_indirection(eid, &field_types);
                     return Ok(vec![match result {
                         Ok((eid, ft)) => PipelineResult::ResolveIndirection {
-                            entity_id: eid.0.to_string(),
-                            field_type: ft.0.to_string(),
+                            entity_id: EntityIdModel { id: eid.0.to_string(), entity_type: {
+                                let et = eid.extract_type();
+                                let name = self.proxy.resolve_entity_type(et).ok();
+                                EntityTypeModel { id: et.0.to_string(), name }
+                            }},
+                            field_type: FieldTypeModel { id: ft.0.to_string(), name: self.proxy.resolve_field_type(ft).ok() },
                         },
                         Err(e) => PipelineResult::Error { message: format!("{:?}", e) },
                     }]);
                 }
             }
         }
-        
+
         // Execute pipeline
         let results = pipeline.execute()?;
-        
-        // Convert results to PipelineResult
+
+        // Convert results to PipelineResult using the recorded command_types metadata
         let mut output = Vec::new();
-        for (i, cmd_type) in command_types.iter().enumerate() {
-            let result = match *cmd_type {
+        for (i, (cmd_name, meta)) in command_types.iter().enumerate() {
+            let result = match *cmd_name {
                 "Read" => {
                     let (value, timestamp, writer_id): (Value, Timestamp, Option<EntityId>) = results.get(i)?;
+                    let writer_model = writer_id.map(|wid| {
+                        let et = wid.extract_type();
+                        let et_name = self.proxy.resolve_entity_type(et).ok();
+                        EntityIdModel { id: wid.0.to_string(), entity_type: EntityTypeModel { id: et.0.to_string(), name: et_name } }
+                    });
                     PipelineResult::Read {
                         value: value_to_json_value(&value),
                         timestamp: timestamp.to_string(),
-                        writer_id: writer_id.map(|id| id.0.to_string()),
+                        writer_id: writer_model,
                     }
                 }
                 "Write" => {
@@ -862,8 +884,10 @@ impl StoreService {
                 }
                 "Create" => {
                     let entity_id: EntityId = results.get(i)?;
+                    let et = entity_id.extract_type();
+                    let et_name = self.proxy.resolve_entity_type(et).ok();
                     PipelineResult::Create {
-                        entity_id: entity_id.0.to_string(),
+                        entity_id: EntityIdModel { id: entity_id.0.to_string(), entity_type: EntityTypeModel { id: et.0.to_string(), name: et_name } },
                     }
                 }
                 "Delete" => {
@@ -872,23 +896,23 @@ impl StoreService {
                 }
                 "GetEntityType" => {
                     let entity_type: EntityType = results.get(i)?;
-                    PipelineResult::GetEntityType {
-                        entity_type: entity_type.0.to_string(),
-                    }
+                    let name = self.proxy.resolve_entity_type(entity_type).ok();
+                    PipelineResult::GetEntityType { entity_type: EntityTypeModel { id: entity_type.0.to_string(), name } }
                 }
                 "ResolveEntityType" => {
                     let name: String = results.get(i)?;
-                    PipelineResult::ResolveEntityType { name }
+                    let id_str = meta.clone().unwrap_or_else(|| "".to_string());
+                    PipelineResult::ResolveEntityType { entity_type: EntityTypeModel { id: id_str, name: Some(name) } }
                 }
                 "GetFieldType" => {
                     let field_type: FieldType = results.get(i)?;
-                    PipelineResult::GetFieldType {
-                        field_type: field_type.0.to_string(),
-                    }
+                    let name = self.proxy.resolve_field_type(field_type).ok();
+                    PipelineResult::GetFieldType { field_type: FieldTypeModel { id: field_type.0.to_string(), name } }
                 }
                 "ResolveFieldType" => {
                     let name: String = results.get(i)?;
-                    PipelineResult::ResolveFieldType { name }
+                    let id_str = meta.clone().unwrap_or_else(|| "".to_string());
+                    PipelineResult::ResolveFieldType { field_type: FieldTypeModel { id: id_str, name: Some(name) } }
                 }
                 "EntityExists" => {
                     let exists: bool = results.get(i)?;
@@ -900,21 +924,28 @@ impl StoreService {
                 }
                 "FindEntities" => {
                     let entities: Vec<EntityId> = results.get(i)?;
-                    PipelineResult::FindEntities {
-                        entities: entities.iter().map(|e| e.0.to_string()).collect(),
+                        let mut models = Vec::new();
+                    for e in entities.iter() {
+                        let et = e.extract_type();
+                        let et_name = self.proxy.resolve_entity_type(et).ok();
+                        models.push(EntityIdModel { id: e.0.to_string(), entity_type: EntityTypeModel { id: et.0.to_string(), name: et_name } });
                     }
+                    PipelineResult::FindEntities { entities: models }
                 }
                 "GetEntityTypes" => {
                     let entity_types: Vec<EntityType> = results.get(i)?;
-                    PipelineResult::GetEntityTypes {
-                        entity_types: entity_types.iter().map(|et| et.0.to_string()).collect(),
+                    let mut out = Vec::new();
+                    for et in entity_types.iter() {
+                        let name = self.proxy.resolve_entity_type(*et).ok();
+                        out.push(EntityTypeModel { id: et.0.to_string(), name });
                     }
+                    PipelineResult::GetEntityTypes { entity_types: out }
                 }
                 _ => PipelineResult::Error { message: "Unknown command type".to_string() },
             };
             output.push(result);
         }
-        
+
         Ok(output)
     }
 }

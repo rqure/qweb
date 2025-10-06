@@ -1,32 +1,50 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EntityTypeModel {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FieldTypeModel {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EntityIdModel {
+    pub id: String,
+    pub entity_type: EntityTypeModel,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadRequest {
-    pub entity_id: String,
+    pub entity_id: EntityIdModel,
     pub fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteRequest {
-    pub entity_id: String,
-    pub field: String,
+    pub entity_id: EntityIdModel,
+    pub field: FieldTypeModel,
     pub value: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRequest {
-    pub entity_type: String,
+    pub entity_type: EntityTypeModel,
     pub name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteRequest {
-    pub entity_id: String,
+    pub entity_id: EntityIdModel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FindRequest {
-    pub entity_type: String,
+    pub entity_type: EntityTypeModel,
     pub filter: Option<String>,
     pub page_size: Option<usize>,
     pub page_number: Option<usize>,
@@ -55,44 +73,44 @@ pub struct LogoutRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SchemaRequest {
-    pub entity_type: String,
+    pub entity_type: EntityTypeModel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompleteSchemaRequest {
-    pub entity_type: String,
+    pub entity_type: EntityTypeModel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveEntityTypeRequest {
-    pub entity_type: String,
+    pub entity_type: EntityTypeModel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveFieldTypeRequest {
-    pub field_type: String,
+    pub field_type: FieldTypeModel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetFieldSchemaRequest {
-    pub entity_type: String,
-    pub field_type: String,
+    pub entity_type: EntityTypeModel,
+    pub field_type: FieldTypeModel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EntityExistsRequest {
-    pub entity_id: String,
+    pub entity_id: EntityIdModel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FieldExistsRequest {
-    pub entity_type: String,
-    pub field_type: String,
+    pub entity_type: EntityTypeModel,
+    pub field_type: FieldTypeModel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveIndirectionRequest {
-    pub entity_id: String,
+    pub entity_id: EntityIdModel,
     pub fields: Vec<String>,
 }
 
@@ -104,19 +122,19 @@ pub struct PipelineRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PipelineCommand {
-    Read { entity_id: String, fields: Vec<String> },
-    Write { entity_id: String, field: String, value: serde_json::Value },
-    Create { entity_type: String, name: String },
-    Delete { entity_id: String },
+    Read { entity_id: EntityIdModel, fields: Vec<String> },
+    Write { entity_id: EntityIdModel, field: FieldTypeModel, value: serde_json::Value },
+    Create { entity_type: EntityTypeModel, name: String },
+    Delete { entity_id: EntityIdModel },
     GetEntityType { name: String },
-    ResolveEntityType { entity_type: String },
+    ResolveEntityType { entity_type: EntityTypeModel },
     GetFieldType { name: String },
-    ResolveFieldType { field_type: String },
-    EntityExists { entity_id: String },
-    FieldExists { entity_type: String, field_type: String },
-    FindEntities { entity_type: String, filter: Option<String> },
+    ResolveFieldType { field_type: FieldTypeModel },
+    EntityExists { entity_id: EntityIdModel },
+    FieldExists { entity_type: EntityTypeModel, field_type: FieldTypeModel },
+    FindEntities { entity_type: EntityTypeModel, filter: Option<String> },
     GetEntityTypes,
-    ResolveIndirection { entity_id: String, fields: Vec<String> },
+    ResolveIndirection { entity_id: EntityIdModel, fields: Vec<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -127,19 +145,19 @@ pub struct PipelineResponse {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PipelineResult {
-    Read { value: serde_json::Value, timestamp: String, writer_id: Option<String> },
+    Read { value: serde_json::Value, timestamp: String, writer_id: Option<EntityIdModel> },
     Write,
-    Create { entity_id: String },
+    Create { entity_id: EntityIdModel },
     Delete,
-    GetEntityType { entity_type: String },
-    ResolveEntityType { name: String },
-    GetFieldType { field_type: String },
-    ResolveFieldType { name: String },
+    GetEntityType { entity_type: EntityTypeModel },
+    ResolveEntityType { entity_type: EntityTypeModel },
+    GetFieldType { field_type: FieldTypeModel },
+    ResolveFieldType { field_type: FieldTypeModel },
     EntityExists { exists: bool },
     FieldExists { exists: bool },
-    FindEntities { entities: Vec<String> },
-    GetEntityTypes { entity_types: Vec<String> },
-    ResolveIndirection { entity_id: String, field_type: String },
+    FindEntities { entities: Vec<EntityIdModel> },
+    GetEntityTypes { entity_types: Vec<EntityTypeModel> },
+    ResolveIndirection { entity_id: EntityIdModel, field_type: FieldTypeModel },
     Error { message: String },
 }
 
