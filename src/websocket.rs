@@ -116,7 +116,7 @@ pub async fn ws_handler(
         let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<qlib_rs::Notification>();
 
         // Track registered configs by config_hash
-        let registered_configs: Arc<RwLock<HashMap<u64, (qlib_rs::NotifyConfig, crate::models::NotifyConfigModel)>>> = Arc::new(RwLock::new(HashMap::new()));
+        let registered_configs: Arc<RwLock<HashMap<u64, qlib_rs::NotifyConfig>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Spawn task to forward notifications to the WebSocket
         let mut session_clone = session.clone();
@@ -185,7 +185,7 @@ pub async fn ws_handler(
         // Unregister all notifications on disconnect
         {
             let map = registered_configs.read().await;
-            for (_hash, (qlib_config, _model)) in map.iter() {
+            for (_hash, qlib_config) in map.iter() {
                 let _ = handle.unregister_notification(qlib_config.clone(), crossbeam_sender.clone()).await;
             }
         }
@@ -223,7 +223,7 @@ async fn handle_ws_request(
     request: WsRequest,
     handle: &StoreHandle,
     notification_sender: &channel::Sender<qlib_rs::Notification>,
-    registered_configs: &Arc<RwLock<HashMap<u64, (qlib_rs::NotifyConfig, crate::models::NotifyConfigModel)>>>,
+    registered_configs: &Arc<RwLock<HashMap<u64, qlib_rs::NotifyConfig>>>,
     subject_id: Option<qlib_rs::EntityId>,
     session_id: Option<qlib_rs::EntityId>,
 ) -> WsResponse {
@@ -409,28 +409,23 @@ async fn handle_ws_request(
                 Some(id) => id,
                 None => return WsResponse::error("Authentication required".to_string()),
             };
-            match config_to_notify_config(&config, handle).await {
-                Ok(notify_config) => {
-                    let config_hash = qlib_rs::hash_notify_config(&notify_config);
-                    {
-                        let map = registered_configs.read().await;
-                        if map.contains_key(&config_hash) {
-                            return WsResponse::error("Notification already registered".to_string());
-                        }
-                    }
-
-                    match handle.register_notification(notify_config.clone(), notification_sender.clone()).await {
-                        Ok(_) => {
-                            let mut map = registered_configs.write().await;
-                            map.insert(config_hash, (notify_config.clone(), config.clone()));
-                            WsResponse::success(serde_json::json!({
-                                "message": "Notification registered"
-                            }))
-                        }
-                        Err(e) => WsResponse::error(format!("Failed to register notification: {:?}", e)),
-                    }
+            let config_hash = qlib_rs::hash_notify_config(&config);
+            {
+                let map = registered_configs.read().await;
+                if map.contains_key(&config_hash) {
+                    return WsResponse::error("Notification already registered".to_string());
                 }
-                Err(e) => WsResponse::error(format!("Invalid config: {}", e)),
+            }
+
+            match handle.register_notification(config.clone(), notification_sender.clone()).await {
+                Ok(_) => {
+                    let mut map = registered_configs.write().await;
+                    map.insert(config_hash, config);
+                    WsResponse::success(serde_json::json!({
+                        "message": "Notification registered"
+                    }))
+                }
+                Err(e) => WsResponse::error(format!("Failed to register notification: {:?}", e)),
             }
         }
         WsRequest::UnregisterNotification { config } => {
@@ -438,28 +433,23 @@ async fn handle_ws_request(
                 Some(id) => id,
                 None => return WsResponse::error("Authentication required".to_string()),
             };
-            match config_to_notify_config(&config, handle).await {
-                Ok(notify_config) => {
-                    let config_hash = qlib_rs::hash_notify_config(&notify_config);
-                    {
-                        let map = registered_configs.read().await;
-                        if !map.contains_key(&config_hash) {
-                            return WsResponse::error("Notification not registered".to_string());
-                        }
-                    }
-
-                    match handle.unregister_notification(notify_config.clone(), notification_sender.clone()).await {
-                        Ok(_) => {
-                            let mut map = registered_configs.write().await;
-                            map.remove(&config_hash);
-                            WsResponse::success(serde_json::json!({
-                                "message": "Notification unregistered"
-                            }))
-                        }
-                        Err(e) => WsResponse::error(format!("Failed to unregister notification: {:?}", e)),
-                    }
+            let config_hash = qlib_rs::hash_notify_config(&config);
+            {
+                let map = registered_configs.read().await;
+                if !map.contains_key(&config_hash) {
+                    return WsResponse::error("Notification not registered".to_string());
                 }
-                Err(e) => WsResponse::error(format!("Invalid config: {}", e)),
+            }
+
+            match handle.unregister_notification(config.clone(), notification_sender.clone()).await {
+                Ok(_) => {
+                    let mut map = registered_configs.write().await;
+                    map.remove(&config_hash);
+                    WsResponse::success(serde_json::json!({
+                        "message": "Notification unregistered"
+                    }))
+                }
+                Err(e) => WsResponse::error(format!("Failed to unregister notification: {:?}", e)),
             }
         }
         WsRequest::Schema { entity_type } => {
@@ -532,20 +522,4 @@ async fn handle_ws_request(
     }
 }
 
-async fn config_to_notify_config(config: &crate::models::NotifyConfigModel, _handle: &StoreHandle) -> Result<qlib_rs::NotifyConfig, String> {
-    match (&config.entity_id, &config.entity_type) {
-        (Some(entity_id), _) => Ok(qlib_rs::NotifyConfig::EntityId {
-            entity_id: *entity_id,
-            field_type: config.field,
-            trigger_on_change: config.trigger_on_change,
-            context: config.context.clone(),
-        }),
-        (_, Some(entity_type)) => Ok(qlib_rs::NotifyConfig::EntityType {
-            entity_type: *entity_type,
-            field_type: config.field,
-            trigger_on_change: config.trigger_on_change,
-            context: config.context.clone(),
-        }),
-        _ => Err(format!("Either entity_id or entity_type must be set")),
-    }
-}
+
