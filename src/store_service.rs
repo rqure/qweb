@@ -530,6 +530,17 @@ impl StoreService {
         (handle, service)
     }
 
+    fn send_result<T>(&self, result: Result<T>, respond_to: oneshot::Sender<Result<T>>)
+    where
+        T: Send + 'static,
+    {
+        if let Err(qlib_rs::Error::ConnectionLost) = &result {
+            log::error!("Connection to store lost, exiting");
+            std::process::exit(1);
+        }
+        let _ = respond_to.send(result);
+    }
+
     /// Run the service, processing commands until the channel is closed
     pub async fn run(&mut self) {
         loop {
@@ -539,6 +550,10 @@ impl StoreService {
             }
             // Process any pending notifications
             if let Err(e) = self.proxy.process_notifications() {
+                if let qlib_rs::Error::ConnectionLost = e {
+                    log::error!("Connection to store lost, exiting");
+                    std::process::exit(1);
+                }
                 log::warn!("Failed to process notifications: {:?}", e);
             }
             // Sleep for 10ms
@@ -550,39 +565,39 @@ impl StoreService {
         match command {
             StoreCommand::GetEntityType { name, respond_to } => {
                 let result = self.proxy.get_entity_type(&name);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::ResolveEntityType {
                 entity_type,
                 respond_to,
             } => {
                 let result = self.proxy.resolve_entity_type(entity_type);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::GetFieldType { name, respond_to } => {
                 let result = self.proxy.get_field_type(&name);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::ResolveFieldType {
                 field_type,
                 respond_to,
             } => {
                 let result = self.proxy.resolve_field_type(field_type);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::GetEntitySchema {
                 entity_type,
                 respond_to,
             } => {
                 let result = self.proxy.get_entity_schema(entity_type);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::GetCompleteEntitySchema {
                 entity_type,
                 respond_to,
             } => {
                 let result = self.proxy.get_complete_entity_schema(entity_type);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::GetFieldSchema {
                 entity_type,
@@ -590,7 +605,7 @@ impl StoreService {
                 respond_to,
             } => {
                 let result = self.proxy.get_field_schema(entity_type, field_type);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::EntityExists {
                 entity_id,
@@ -613,7 +628,7 @@ impl StoreService {
                 respond_to,
             } => {
                 let result = self.proxy.resolve_indirection(entity_id, &fields);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::Read {
                 entity_id,
@@ -621,7 +636,7 @@ impl StoreService {
                 respond_to,
             } => {
                 let result = self.proxy.read(entity_id, &field_path);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::Write {
                 entity_id,
@@ -642,7 +657,7 @@ impl StoreService {
                     push_condition,
                     adjust_behavior,
                 );
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::CreateEntity {
                 entity_type,
@@ -651,14 +666,14 @@ impl StoreService {
                 respond_to,
             } => {
                 let result = self.proxy.create_entity(entity_type, parent_id, &name);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::DeleteEntity {
                 entity_id,
                 respond_to,
             } => {
                 let result = self.proxy.delete_entity(entity_id);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::FindEntitiesPaginated {
                 entity_type,
@@ -671,7 +686,7 @@ impl StoreService {
                     page_opts.as_ref(),
                     filter.as_deref(),
                 );
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::FindEntities {
                 entity_type,
@@ -679,23 +694,23 @@ impl StoreService {
                 respond_to,
             } => {
                 let result = self.proxy.find_entities(entity_type, filter.as_deref());
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::AuthenticateUser { name, password, respond_to } => {
                 let result = qlib_rs::auth::authenticate_user(&mut self.proxy, &name, &password, &self.auth_config);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::GetScope { subject_id, resource_id, field, respond_to } => {
                 if let Some(cache) = &self.permission_cache {
                     let result = qlib_rs::auth::get_scope(&self.proxy, &mut self.cel_executor, cache, subject_id, resource_id, field);
-                    let _ = respond_to.send(result);
+                    self.send_result(result, respond_to);
                 } else {
                     let _ = respond_to.send(Err(qlib_rs::Error::StoreProxyError("Permission cache not available".to_string())));
                 }
             }
             StoreCommand::RegisterNotification { config, sender, respond_to } => {
                 let result = self.proxy.register_notification(config, sender);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::UnregisterNotification { config, sender, respond_to } => {
                 self.proxy.unregister_notification(&config, &sender);
@@ -703,11 +718,11 @@ impl StoreService {
             }
             StoreCommand::ExecutePipeline { commands, respond_to } => {
                 let result = self.execute_pipeline_commands(commands);
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
             StoreCommand::MachineInfo { respond_to } => {
                 let result = self.proxy.machine_info();
-                let _ = respond_to.send(result);
+                self.send_result(result, respond_to);
             }
         }
     }
