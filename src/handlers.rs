@@ -1,5 +1,5 @@
 use actix_web::{web, HttpResponse, Responder, HttpRequest};
-use qlib_rs::{EntityId, PageOpts, EntityType, FieldType};
+use qlib_rs::{EntityId, PageOpts, FieldType};
 use qlib_rs::auth::AuthorizationScope;
 
 use crate::models::{
@@ -10,45 +10,6 @@ use crate::models::{
     LogoutRequest,
 };
 use crate::AppState;
-use crate::store_service::StoreHandle;
-use crate::models::{EntityIdModel, EntityTypeModel, FieldTypeModel};
-
-/// Helper function to resolve a field identifier (either name or numeric ID)
-async fn resolve_field_identifier(handle: &StoreHandle, field_identifier: &str) -> Result<FieldType, String> {
-    // Try to parse as a numeric field type ID first, otherwise look up by name
-    if let Ok(field_type_id) = field_identifier.parse::<u64>() {
-        Ok(FieldType(field_type_id))
-    } else {
-        handle.get_field_type(field_identifier).await
-            .map_err(|e| format!("Failed to get field type for '{}': {:?}", field_identifier, e))
-    }
-}
-
-// Parse an EntityIdModel into a concrete EntityId
-fn parse_entity_id_model(model: &EntityIdModel) -> Result<EntityId, String> {
-    let id = model.id.parse::<u64>().map_err(|e| format!("Invalid entity ID: {}", e))?;
-    Ok(EntityId(id))
-}
-
-// Resolve an EntityTypeModel into a concrete EntityType (may consult store by name)
-async fn resolve_entity_type_model(handle: &StoreHandle, model: &EntityTypeModel) -> Result<EntityType, String> {
-    let id_str = &model.id;
-    if let Ok(v) = id_str.parse::<u32>() {
-        Ok(EntityType(v))
-    } else {
-        handle.get_entity_type(id_str).await.map_err(|e| format!("Failed to get entity type '{}': {:?}", id_str, e))
-    }
-}
-
-// Resolve a FieldTypeModel into a concrete FieldType (may consult store by name)
-async fn resolve_field_type_model(handle: &StoreHandle, model: &FieldTypeModel) -> Result<FieldType, String> {
-    let id_str = &model.id;
-    if let Ok(v) = id_str.parse::<u64>() {
-        Ok(FieldType(v))
-    } else {
-        handle.get_field_type(id_str).await.map_err(|e| format!("Failed to get field type '{}': {:?}", id_str, e))
-    }
-}
 
 pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> impl Responder {
     let handle = &state.store_handle;
@@ -297,36 +258,18 @@ pub async fn read(req: HttpRequest, state: web::Data<AppState>, body: web::Json<
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_id = match parse_entity_id_model(&body.entity_id) {
-        Ok(e) => e,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_id = body.entity_id;
 
     let mut field_types = Vec::new();
-    for field_name in &body.fields {
-        // Try to parse as a numeric field type ID first, otherwise look up by name
-        let ft = if let Ok(field_type_id) = field_name.parse::<u64>() {
-            FieldType(field_type_id)
-        } else {
-            match handle.get_field_type(field_name).await {
-                Ok(ft) => ft,
-                Err(e) => {
-                    return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
-                        "Failed to get field type for '{}': {:?}",
-                        field_name, e
-                    )));
-                }
-            }
-        };
-        
-        let scope = match handle.get_scope(subject_id, entity_id, ft).await {
+    for ft in &body.fields {
+        let scope = match handle.get_scope(subject_id, entity_id, *ft).await {
             Ok(s) => s,
             Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Authorization check failed: {:?}", e))),
         };
         if scope == AuthorizationScope::None {
             return HttpResponse::Forbidden().json(ApiResponse::<()>::error("Access denied".to_string()));
         }
-        field_types.push(ft);
+        field_types.push(*ft);
     }
 
     match handle.read(entity_id, &field_types).await {
@@ -384,15 +327,8 @@ pub async fn write(req: HttpRequest, state: web::Data<AppState>, body: web::Json
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_id = match parse_entity_id_model(&body.entity_id) {
-        Ok(e) => e,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
-
-    let field_type = match resolve_field_type_model(handle, &body.field).await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_id = body.entity_id;
+    let field_type = body.field;
 
     let scope = match handle.get_scope(subject_id, entity_id, field_type).await {
         Ok(s) => s,
@@ -402,13 +338,7 @@ pub async fn write(req: HttpRequest, state: web::Data<AppState>, body: web::Json
         return HttpResponse::Forbidden().json(ApiResponse::<()>::error("Access denied".to_string()));
     }
 
-    let value = match json_to_value(&body.value) {
-        Ok(v) => v,
-        Err(e) => {
-            return HttpResponse::BadRequest()
-                .json(ApiResponse::<()>::error(format!("Invalid value: {}", e)));
-        }
-    };
+    let value = body.value.clone();
 
     match handle.write(entity_id, &[field_type], value, None, None, None, None).await {
         Ok(_) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
@@ -427,10 +357,7 @@ pub async fn create(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_type = match resolve_entity_type_model(handle, &body.entity_type).await {
-        Ok(et) => et,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_type = body.entity_type;
 
     let scope = match handle.get_scope(subject_id, EntityId::new(entity_type, 0), FieldType(0)).await {
         Ok(s) => s,
@@ -443,9 +370,8 @@ pub async fn create(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
 
     match handle.create_entity(entity_type, None, &body.name).await {
         Ok(entity_id) => {
-            let req_et_name = body.entity_type.name.clone();
             HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-                "entity_id": { "id": entity_id.0.to_string(), "entity_type": { "id": entity_type.0.to_string(), "name": req_et_name } },
+                "entity_id": entity_id,
                 "name": body.name
             })))
         }
@@ -462,10 +388,7 @@ pub async fn delete(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_id = match parse_entity_id_model(&body.entity_id) {
-        Ok(e) => e,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_id = body.entity_id;
 
     let scope = match handle.get_scope(subject_id, entity_id, FieldType(0)).await {
         Ok(s) => s,
@@ -493,10 +416,7 @@ pub async fn find(req: HttpRequest, state: web::Data<AppState>, body: web::Json<
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_type = match resolve_entity_type_model(handle, &body.entity_type).await {
-        Ok(et) => et,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_type = body.entity_type;
 
     let page_opts = if body.page_size.is_some() || body.page_number.is_some() {
         Some(PageOpts {
@@ -509,21 +429,8 @@ pub async fn find(req: HttpRequest, state: web::Data<AppState>, body: web::Json<
 
     match handle.find_entities_paginated(entity_type, page_opts.as_ref(), body.filter.as_deref()).await {
         Ok(result) => {
-            // Build structured entity representations: { id: string, entity_type: { id: string, name: string } }
-            let mut entities_json = Vec::new();
-            for id in result.items.iter() {
-                let et = id.extract_type();
-                let et_name = match handle.resolve_entity_type(et).await {
-                    Ok(n) => n,
-                    Err(_) => et.0.to_string(),
-                };
-                entities_json.push(serde_json::json!({
-                    "id": id.0.to_string(),
-                    "entity_type": { "id": et.0.to_string(), "name": et_name }
-                }));
-            }
             HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-                "entities": entities_json,
+                "entities": result.items,
                 "total": result.total,
                 "next_cursor": result.next_cursor
             })))
@@ -541,29 +448,13 @@ pub async fn schema(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_type = match resolve_entity_type_model(handle, &body.entity_type).await {
-        Ok(et) => et,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_type = body.entity_type;
 
     match handle.get_entity_schema(entity_type).await {
         Ok(schema) => {
-            // Build EntitySchemaModel for JSON-friendly response
-            let et_name = handle.resolve_entity_type(entity_type).await.ok();
-            let entity_type_model = EntityTypeModel { id: entity_type.0.to_string(), name: et_name.unwrap_or(entity_type.0.to_string()) };
-
-            let mut fields = Vec::new();
-            for (ft, fs) in schema.fields.iter() {
-                let ft_name = handle.resolve_field_type(*ft).await.ok();
-                let field_type_model = FieldTypeModel { id: ft.0.to_string(), name: ft_name.unwrap_or(ft.0.to_string()) };
-                let default_value = serde_json::to_value(&fs.default_value()).unwrap_or(serde_json::Value::Null);
-                fields.push(crate::models::FieldSchemaModel { field_type: field_type_model, rank: fs.rank(), default_value });
-            }
-
-            let schema_model = crate::models::EntitySchemaModel { entity_type: entity_type_model, inherit: Vec::new(), fields };
             HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-                "entity_type": body.entity_type,
-                "schema": schema_model
+                "entity_type": entity_type,
+                "schema": schema
             })))
         }
         Err(e) => HttpResponse::InternalServerError()
@@ -579,28 +470,13 @@ pub async fn complete_schema(req: HttpRequest, state: web::Data<AppState>, body:
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_type = match resolve_entity_type_model(handle, &body.entity_type).await {
-        Ok(et) => et,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_type = body.entity_type;
 
     match handle.get_complete_entity_schema(entity_type).await {
         Ok(schema) => {
-            let et_name = handle.resolve_entity_type(entity_type).await.ok();
-            let entity_type_model = EntityTypeModel { id: entity_type.0.to_string(), name: et_name.unwrap_or(entity_type.0.to_string()) };
-
-            let mut fields = Vec::new();
-            for (ft, fs) in schema.fields.iter() {
-                let ft_name = handle.resolve_field_type(*ft).await.ok();
-                let field_type_model = FieldTypeModel { id: ft.0.to_string(), name: ft_name.unwrap_or(ft.0.to_string()) };
-                let default_value = serde_json::to_value(&fs.default_value()).unwrap_or(serde_json::Value::Null);
-                fields.push(crate::models::FieldSchemaModel { field_type: field_type_model, rank: fs.rank(), default_value });
-            }
-
-            let schema_model = crate::models::EntitySchemaModel { entity_type: entity_type_model.clone(), inherit: Vec::new(), fields };
             HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-                "entity_type": { "id": entity_type_model.id, "name": entity_type_model.name },
-                "schema": schema_model
+                "entity_type": entity_type,
+                "schema": schema
             })))
         }
         Err(e) => HttpResponse::InternalServerError()
@@ -616,16 +492,11 @@ pub async fn resolve_entity_type(req: HttpRequest, state: web::Data<AppState>, b
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    // Accept either numeric id or a model (name/id)
-    let entity_type = match resolve_entity_type_model(handle, &body.entity_type).await {
-        Ok(et) => et,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_type = body.entity_type;
 
-    let id_str = body.entity_type.id.clone();
     match handle.resolve_entity_type(entity_type).await {
         Ok(name) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-            "entity_type": { "id": id_str, "name": name }
+            "name": name
         }))),
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to resolve entity type: {:?}", e))),
@@ -640,15 +511,11 @@ pub async fn resolve_field_type(req: HttpRequest, state: web::Data<AppState>, bo
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let field_type = match resolve_field_type_model(handle, &body.field_type).await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let field_type = body.field_type;
 
-    let id_str = body.field_type.id.clone();
     match handle.resolve_field_type(field_type).await {
         Ok(name) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-            "field_type": { "id": id_str, "name": name }
+            "name": name
         }))),
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to resolve field type: {:?}", e))),
@@ -663,28 +530,15 @@ pub async fn get_field_schema(req: HttpRequest, state: web::Data<AppState>, body
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_type = match resolve_entity_type_model(handle, &body.entity_type).await {
-        Ok(et) => et,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
-
-    let field_type = match resolve_field_type_model(handle, &body.field_type).await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_type = body.entity_type;
+    let field_type = body.field_type;
 
     match handle.get_field_schema(entity_type, field_type).await {
         Ok(schema) => {
-            let ft_name = handle.resolve_field_type(field_type).await.ok();
-            let field_schema_model = crate::models::FieldSchemaModel {
-                field_type: FieldTypeModel { id: field_type.0.to_string(), name: ft_name.unwrap_or(field_type.0.to_string()) },
-                rank: schema.rank(),
-                default_value: serde_json::to_value(&schema.default_value()).unwrap_or(serde_json::Value::Null),
-            };
             HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-                "entity_type": body.entity_type,
-                "field_type": body.field_type,
-                "schema": field_schema_model
+                "entity_type": entity_type,
+                "field_type": field_type,
+                "schema": schema
             })))
         }
         Err(e) => HttpResponse::InternalServerError()
@@ -700,16 +554,11 @@ pub async fn entity_exists(req: HttpRequest, state: web::Data<AppState>, body: w
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_id = match parse_entity_id_model(&body.entity_id) {
-        Ok(e) => e,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_id = body.entity_id;
 
     let exists = handle.entity_exists(entity_id).await;
-    let et = entity_id.extract_type();
-    let et_name = handle.resolve_entity_type(et).await.ok();
     HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-        "entity_id": { "id": entity_id.0.to_string(), "entity_type": { "id": et.0.to_string(), "name": et_name } },
+        "entity_id": entity_id,
         "exists": exists
     })))
 }
@@ -722,22 +571,13 @@ pub async fn field_exists(req: HttpRequest, state: web::Data<AppState>, body: we
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_type = match resolve_entity_type_model(handle, &body.entity_type).await {
-        Ok(et) => et,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
-
-    let field_type = match resolve_field_type_model(handle, &body.field_type).await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_type = body.entity_type;
+    let field_type = body.field_type;
 
     let exists = handle.field_exists(entity_type, field_type).await;
-    let et_name = handle.resolve_entity_type(entity_type).await.ok();
-    let ft_name = handle.resolve_field_type(field_type).await.ok();
     HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-        "entity_type": { "id": entity_type.0.to_string(), "name": et_name },
-        "field_type": { "id": field_type.0.to_string(), "name": ft_name },
+        "entity_type": entity_type,
+        "field_type": field_type,
         "exists": exists
     })))
 }
@@ -750,27 +590,13 @@ pub async fn resolve_indirection(req: HttpRequest, state: web::Data<AppState>, b
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
 
-    let entity_id = match parse_entity_id_model(&body.entity_id) {
-        Ok(e) => e,
-        Err(e) => return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e)),
-    };
+    let entity_id = body.entity_id;
+    let field_types = &body.fields;
 
-    let mut field_types = Vec::new();
-    for field_name in &body.fields {
-        match resolve_field_identifier(handle, field_name).await {
-            Ok(ft) => field_types.push(ft),
-            Err(e) => {
-                return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e));
-            }
-        }
-    }
-
-    match handle.resolve_indirection(entity_id, &field_types).await {
+    match handle.resolve_indirection(entity_id, field_types).await {
         Ok((resolved_entity_id, resolved_field_type)) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-            "entity_id": body.entity_id,
-            "fields": body.fields,
-            "resolved_entity_id": resolved_entity_id.0.to_string(),
-            "resolved_field_type": resolved_field_type.0.to_string()
+            "resolved_entity_id": resolved_entity_id,
+            "resolved_field_type": resolved_field_type
         }))),
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to resolve indirection: {:?}", e))),
@@ -810,39 +636,6 @@ async fn check_session_ownership(
         Ok(parent_id == qweb_service_id)
     } else {
         Err("Session has no parent".to_string())
-    }
-}
-
-fn json_to_value(json: &serde_json::Value) -> Result<qlib_rs::Value, String> {
-    match json {
-        serde_json::Value::Null => Ok(qlib_rs::Value::EntityReference(None)),
-        serde_json::Value::Bool(b) => Ok(qlib_rs::Value::Bool(*b)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(qlib_rs::Value::Int(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(qlib_rs::Value::Float(f))
-            } else {
-                Err("Number out of range".to_string())
-            }
-        }
-        serde_json::Value::String(s) => Ok(qlib_rs::Value::String(s.clone())),
-        serde_json::Value::Array(arr) => {
-            let mut ids = Vec::new();
-            for item in arr {
-                if let serde_json::Value::Number(n) = item {
-                    if let Some(id) = n.as_u64() {
-                        ids.push(qlib_rs::EntityId(id));
-                    } else {
-                        return Err("Array contains non-integer entity ID".to_string());
-                    }
-                } else {
-                    return Err("Array must contain entity IDs (numbers)".to_string());
-                }
-            }
-            Ok(qlib_rs::Value::EntityList(ids))
-        }
-        serde_json::Value::Object(_) => Err("Object values not supported".to_string()),
     }
 }
 

@@ -1,50 +1,34 @@
 use serde::{Deserialize, Serialize};
+use qlib_rs::{EntityId, EntityType, FieldType, Value};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct EntityTypeModel {
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct FieldTypeModel {
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct EntityIdModel {
-    pub id: String,
-    pub entity_type: EntityTypeModel,
-}
-
+// API Request models - use qlib_rs types directly
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadRequest {
-    pub entity_id: EntityIdModel,
-    pub fields: Vec<String>,
+    pub entity_id: EntityId,
+    pub fields: Vec<FieldType>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteRequest {
-    pub entity_id: EntityIdModel,
-    pub field: FieldTypeModel,
-    pub value: serde_json::Value,
+    pub entity_id: EntityId,
+    pub field: FieldType,
+    pub value: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRequest {
-    pub entity_type: EntityTypeModel,
+    pub entity_type: EntityType,
     pub name: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteRequest {
-    pub entity_id: EntityIdModel,
+    pub entity_id: EntityId,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FindRequest {
-    pub entity_type: EntityTypeModel,
+    pub entity_type: EntityType,
     pub filter: Option<String>,
     pub page_size: Option<usize>,
     pub page_number: Option<usize>,
@@ -73,45 +57,45 @@ pub struct LogoutRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SchemaRequest {
-    pub entity_type: EntityTypeModel,
+    pub entity_type: EntityType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompleteSchemaRequest {
-    pub entity_type: EntityTypeModel,
+    pub entity_type: EntityType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveEntityTypeRequest {
-    pub entity_type: EntityTypeModel,
+    pub entity_type: EntityType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveFieldTypeRequest {
-    pub field_type: FieldTypeModel,
+    pub field_type: FieldType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetFieldSchemaRequest {
-    pub entity_type: EntityTypeModel,
-    pub field_type: FieldTypeModel,
+    pub entity_type: EntityType,
+    pub field_type: FieldType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EntityExistsRequest {
-    pub entity_id: EntityIdModel,
+    pub entity_id: EntityId,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FieldExistsRequest {
-    pub entity_type: EntityTypeModel,
-    pub field_type: FieldTypeModel,
+    pub entity_type: EntityType,
+    pub field_type: FieldType,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveIndirectionRequest {
-    pub entity_id: EntityIdModel,
-    pub fields: Vec<String>,
+    pub entity_id: EntityId,
+    pub fields: Vec<FieldType>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,19 +106,19 @@ pub struct PipelineRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PipelineCommand {
-    Read { entity_id: EntityIdModel, fields: Vec<String> },
-    Write { entity_id: EntityIdModel, field: FieldTypeModel, value: serde_json::Value },
-    Create { entity_type: EntityTypeModel, name: String },
-    Delete { entity_id: EntityIdModel },
+    Read { entity_id: EntityId, fields: Vec<FieldType> },
+    Write { entity_id: EntityId, field: FieldType, value: Value },
+    Create { entity_type: EntityType, name: String },
+    Delete { entity_id: EntityId },
     GetEntityType { name: String },
-    ResolveEntityType { entity_type: EntityTypeModel },
+    ResolveEntityType { entity_type: EntityType },
     GetFieldType { name: String },
-    ResolveFieldType { field_type: FieldTypeModel },
-    EntityExists { entity_id: EntityIdModel },
-    FieldExists { entity_type: EntityTypeModel, field_type: FieldTypeModel },
-    FindEntities { entity_type: EntityTypeModel, filter: Option<String> },
+    ResolveFieldType { field_type: FieldType },
+    EntityExists { entity_id: EntityId },
+    FieldExists { entity_type: EntityType, field_type: FieldType },
+    FindEntities { entity_type: EntityType, filter: Option<String> },
     GetEntityTypes,
-    ResolveIndirection { entity_id: EntityIdModel, fields: Vec<String> },
+    ResolveIndirection { entity_id: EntityId, fields: Vec<FieldType> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -145,19 +129,19 @@ pub struct PipelineResponse {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PipelineResult {
-    Read { value: serde_json::Value, timestamp: String, writer_id: Option<EntityIdModel> },
+    Read { value: Value, timestamp: qlib_rs::Timestamp, writer_id: Option<EntityId> },
     Write,
-    Create { entity_id: EntityIdModel },
+    Create { entity_id: EntityId },
     Delete,
-    GetEntityType { entity_type: EntityTypeModel },
-    ResolveEntityType { entity_type: EntityTypeModel },
-    GetFieldType { field_type: FieldTypeModel },
-    ResolveFieldType { field_type: FieldTypeModel },
+    GetEntityType { entity_type: EntityType },
+    ResolveEntityType { name: String },
+    GetFieldType { field_type: FieldType },
+    ResolveFieldType { name: String },
     EntityExists { exists: bool },
     FieldExists { exists: bool },
-    FindEntities { entities: Vec<EntityIdModel> },
-    GetEntityTypes { entity_types: Vec<EntityTypeModel> },
-    ResolveIndirection { entity_id: EntityIdModel, field_type: FieldTypeModel },
+    FindEntities { entities: Vec<EntityId> },
+    GetEntityTypes { entity_types: Vec<EntityType> },
+    ResolveIndirection { entity_id: EntityId, field_type: FieldType },
     Error { message: String },
 }
 
@@ -186,57 +170,7 @@ impl<T> ApiResponse<T> {
     }
 }
 
-    // ---------------------------------------------------------------------------
-    // Notification models
-    // ---------------------------------------------------------------------------
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct NotifyConfigModel {
-        pub entity_id: Option<String>,
-        pub entity_type: Option<String>,
-        pub field: String,
-        pub trigger_on_change: bool,
-        pub context: Vec<Vec<String>>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct NotifyInfoModel {
-        pub entity_id: Option<String>,
-        /// Field path represented as a list of field type IDs (as strings) for indirection
-        pub field_path: Vec<String>,
-        /// Value serialized the same way qweb sends values (e.g. {"Int": 42} / {"String": "x"})
-        pub value: Option<serde_json::Value>,
-        /// Timestamp may be represented as either an ISO string or an object with secs/nanos
-        pub timestamp: Option<serde_json::Value>,
-        pub writer_id: Option<String>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct NotificationModel {
-        pub current: NotifyInfoModel,
-        pub previous: NotifyInfoModel,
-        /// Context map where the key is a comma-separated list of field type IDs
-        pub context: std::collections::BTreeMap<String, NotifyInfoModel>,
-        pub config_hash: u64,
-        /// Optionally include the original notify config so clients can easily match callbacks
-        pub config: Option<NotifyConfigModel>,
-    }
-
-    // ---------------------------------------------------------------------------
-    // Schema models
-    // ---------------------------------------------------------------------------
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct FieldSchemaModel {
-        pub field_type: FieldTypeModel,
-        pub rank: i64,
-        /// Default value encoded as qweb values (variant object form)
-        pub default_value: serde_json::Value,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct EntitySchemaModel {
-        pub entity_type: EntityTypeModel,
-        pub inherit: Vec<EntityTypeModel>,
-        pub fields: Vec<FieldSchemaModel>,
-    }
+// ---------------------------------------------------------------------------
+// Notification models - these are kept for frontend serialization compatibility
+// but can be replaced with qlib_rs types in the future
+// ---------------------------------------------------------------------------

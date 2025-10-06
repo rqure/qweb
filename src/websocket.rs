@@ -12,18 +12,7 @@ use tokio::sync::RwLock;
 use crate::store_service::StoreHandle;
 use crate::AppState;
 
-use qlib_rs::{auth::AuthorizationScope, EntityId, FieldType};
-
-/// Helper function to resolve a field identifier (either name or numeric ID)
-async fn resolve_field_identifier(handle: &StoreHandle, field_identifier: &str) -> Result<FieldType, String> {
-    // Try to parse as a numeric field type ID first, otherwise look up by name
-    if let Ok(field_type_id) = field_identifier.parse::<u64>() {
-        Ok(FieldType(field_type_id))
-    } else {
-        handle.get_field_type(field_identifier).await
-            .map_err(|e| format!("Failed to get field type for '{}': {:?}", field_identifier, e))
-    }
-}
+use qlib_rs::{auth::AuthorizationScope, EntityId, EntityType, FieldType, NotifyConfig, Value};
 
 /// Check session ownership for websocket connections
 async fn check_websocket_session_ownership(
@@ -45,27 +34,24 @@ async fn check_websocket_session_ownership(
     }
 }
 
-// Use shared model defined in crate::models for notification configuration
-// (crate::models::NotifyConfigModel)
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum WsRequest {
-    Read { entity_id: String, fields: Vec<String> },
-    Write { entity_id: String, field: String, value: serde_json::Value },
-    Create { entity_type: String, name: String },
-    Delete { entity_id: String },
-    Find { entity_type: String, filter: Option<String> },
-    RegisterNotification { config: crate::models::NotifyConfigModel },
-    UnregisterNotification { config: crate::models::NotifyConfigModel },
-    Schema { entity_type: String },
-    CompleteSchema { entity_type: String },
-    ResolveEntityType { entity_type: String },
-    ResolveFieldType { field_type: String },
-    GetFieldSchema { entity_type: String, field_type: String },
-    EntityExists { entity_id: String },
-    FieldExists { entity_type: String, field_type: String },
-    ResolveIndirection { entity_id: String, fields: Vec<String> },
+    Read { entity_id: EntityId, fields: Vec<FieldType> },
+    Write { entity_id: EntityId, field: FieldType, value: Value },
+    Create { entity_type: EntityType, name: String },
+    Delete { entity_id: EntityId },
+    Find { entity_type: EntityType, filter: Option<String> },
+    RegisterNotification { config: NotifyConfig },
+    UnregisterNotification { config: NotifyConfig },
+    Schema { entity_type: EntityType },
+    CompleteSchema { entity_type: EntityType },
+    ResolveEntityType { entity_type: EntityType },
+    ResolveFieldType { field_type: FieldType },
+    GetFieldSchema { entity_type: EntityType, field_type: FieldType },
+    EntityExists { entity_id: EntityId },
+    FieldExists { entity_type: EntityType, field_type: FieldType },
+    ResolveIndirection { entity_id: EntityId, fields: Vec<FieldType> },
     Pipeline { commands: Vec<crate::models::PipelineCommand> },
     Refresh,
     Ping,
@@ -125,23 +111,20 @@ pub async fn ws_handler(
     rt::spawn(async move {
         info!("WebSocket connection established");
 
-        // Create channels for notifications: crossbeam receives qlib notifications from store
-        // while tokio channel carries our JSON-friendly NotificationModel to the WebSocket
+        // Create channels for notifications
         let (crossbeam_sender, crossbeam_receiver) = channel::unbounded::<qlib_rs::Notification>();
-        let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<crate::models::NotificationModel>();
+        let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<qlib_rs::Notification>();
 
-        // Track registered configs by config_hash so we can attach the original config to
-        // outgoing notifications. We keep both the qlib config (for unregistering) and
-        // the incoming model for client consumption.
+        // Track registered configs by config_hash
         let registered_configs: Arc<RwLock<HashMap<u64, (qlib_rs::NotifyConfig, crate::models::NotifyConfigModel)>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        // Spawn task to forward NotificationModel objects to the WebSocket
+        // Spawn task to forward notifications to the WebSocket
         let mut session_clone = session.clone();
         tokio::spawn(async move {
-            while let Some(notification_model) = tokio_receiver.recv().await {
+            while let Some(notification) = tokio_receiver.recv().await {
                 let notification_json = serde_json::to_string(&WsResponse::success(serde_json::json!({
                     "type": "notification",
-                    "notification": notification_model
+                    "notification": notification
                 }))).unwrap();
                 if let Err(e) = session_clone.text(notification_json).await {
                     error!("Failed to send notification: {}", e);
@@ -150,45 +133,12 @@ pub async fn ws_handler(
             }
         });
 
-        // Spawn task to poll for qlib notifications from crossbeam, map them to
-        // NotificationModel and send to the tokio channel.
-        let registered_configs_clone = registered_configs.clone();
+        // Spawn task to poll for qlib notifications from crossbeam
         tokio::spawn(async move {
             loop {
                 match crossbeam_receiver.try_recv() {
                     Ok(notification) => {
-                        // Map qlib notification into our model, attaching the registered config if present
-                        let config_opt = {
-                            let map = registered_configs_clone.read().await;
-                            map.get(&notification.config_hash).map(|(_, m)| m.clone())
-                        };
-
-                        // Convert NotifyInfo -> NotifyInfoModel
-                        let map_notify_info = |info: &qlib_rs::NotifyInfo| -> crate::models::NotifyInfoModel {
-                            crate::models::NotifyInfoModel {
-                                entity_id: Some(info.entity_id.0.to_string()),
-                                field_path: info.field_path.iter().map(|ft| ft.0.to_string()).collect(),
-                                value: info.value.clone().map(|v| serde_json::to_value(&v).unwrap_or(serde_json::Value::Null)),
-                                timestamp: info.timestamp.clone().map(|t| serde_json::to_value(&t).unwrap_or(serde_json::Value::String("".to_string()))),
-                                writer_id: info.writer_id.map(|wid| wid.0.to_string()),
-                            }
-                        };
-
-                        let mut ctx = std::collections::BTreeMap::new();
-                        for (key_vec, info) in notification.context.iter() {
-                            let key_str = key_vec.iter().map(|ft| ft.0.to_string()).collect::<Vec<_>>().join(",");
-                            ctx.insert(key_str, map_notify_info(info));
-                        }
-
-                        let notification_model = crate::models::NotificationModel {
-                            current: map_notify_info(&notification.current),
-                            previous: map_notify_info(&notification.previous),
-                            context: ctx,
-                            config_hash: notification.config_hash,
-                            config: config_opt,
-                        };
-
-                        if tokio_sender.send(notification_model).is_err() {
+                        if tokio_sender.send(notification).is_err() {
                             break;
                         }
                     }
@@ -347,28 +297,12 @@ async fn handle_ws_request(
         }
         
         WsRequest::Read { entity_id, fields } => {
-
             let subject_id = match subject_id {
                 Some(id) => id,
                 None => return WsResponse::error("Authentication required".to_string()),
             };
 
-            let entity_id = match entity_id.parse::<u64>() {
-                Ok(id) => qlib_rs::EntityId(id),
-                Err(e) => return WsResponse::error(format!("Invalid entity ID: {}", e)),
-            };
-
-            let mut field_types = Vec::new();
-            for field_name in &fields {
-                match resolve_field_identifier(handle, field_name).await {
-                    Ok(ft) => field_types.push(ft),
-                    Err(e) => {
-                        return WsResponse::error(e)
-                    }
-                }
-            }
-
-            for &ft in &field_types {
+            for &ft in &fields {
                 let scope = match handle.get_scope(subject_id, entity_id, ft).await {
                     Ok(s) => s,
                     Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
@@ -378,12 +312,11 @@ async fn handle_ws_request(
                 }
             }
 
-            match handle.read(entity_id, &field_types).await {
+            match handle.read(entity_id, &fields).await {
                 Ok((value, timestamp, writer_id)) => WsResponse::success(serde_json::json!({
-                    "entity_id": entity_id.0.to_string(),
-                    "value": format!("{:?}", value),
-                    "timestamp": timestamp.to_string(),
-                    "writer_id": writer_id.map(|id| id.0.to_string())
+                    "value": value,
+                    "timestamp": timestamp,
+                    "writer_id": writer_id
                 })),
                 Err(e) => WsResponse::error(format!("Failed to read entity: {:?}", e)),
             }
@@ -395,17 +328,7 @@ async fn handle_ws_request(
                 None => return WsResponse::error("Authentication required".to_string()),
             };
 
-            let entity_id = match entity_id.parse::<u64>() {
-                Ok(id) => qlib_rs::EntityId(id),
-                Err(e) => return WsResponse::error(format!("Invalid entity ID: {}", e)),
-            };
-
-            let field_type = match resolve_field_identifier(handle, &field).await {
-                Ok(ft) => ft,
-                Err(e) => return WsResponse::error(e),
-            };
-
-            let scope = match handle.get_scope(subject_id, entity_id, field_type).await {
+            let scope = match handle.get_scope(subject_id, entity_id, field).await {
                 Ok(s) => s,
                 Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
             };
@@ -413,12 +336,7 @@ async fn handle_ws_request(
                 return WsResponse::error("Access denied".to_string());
             }
 
-            let qlib_value = match json_to_qlib_value(&value) {
-                Ok(v) => v,
-                Err(e) => return WsResponse::error(format!("Invalid value: {}", e)),
-            };
-
-            match handle.write(entity_id, &[field_type], qlib_value, None, None, None, None).await {
+            match handle.write(entity_id, &[field], value, None, None, None, None).await {
                 Ok(_) => WsResponse::success(serde_json::json!({
                     "message": "Successfully wrote value"
                 })),
@@ -432,12 +350,7 @@ async fn handle_ws_request(
                 None => return WsResponse::error("Authentication required".to_string()),
             };
 
-            let et = match handle.get_entity_type(&entity_type).await {
-                Ok(et) => et,
-                Err(e) => return WsResponse::error(format!("Failed to get entity type: {:?}", e)),
-            };
-
-            let scope = match handle.get_scope(subject_id, qlib_rs::EntityId::new(et, 0), qlib_rs::FieldType(0)).await {
+            let scope = match handle.get_scope(subject_id, qlib_rs::EntityId::new(entity_type, 0), qlib_rs::FieldType(0)).await {
                 Ok(s) => s,
                 Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
             };
@@ -446,10 +359,9 @@ async fn handle_ws_request(
                 return WsResponse::error("Access denied".to_string());
             }
 
-            match handle.create_entity(et, None, &name).await {
+            match handle.create_entity(entity_type, None, &name).await {
                 Ok(entity_id) => WsResponse::success(serde_json::json!({
-                    "entity_id": entity_id.0.to_string(),
-                    "entity_type": entity_type,
+                    "entity_id": entity_id,
                     "name": name
                 })),
                 Err(e) => WsResponse::error(format!("Failed to create entity: {:?}", e)),
@@ -462,12 +374,7 @@ async fn handle_ws_request(
                 None => return WsResponse::error("Authentication required".to_string()),
             };
 
-            let entity_id_parsed = match entity_id.parse::<u64>() {
-                Ok(id) => qlib_rs::EntityId(id),
-                Err(e) => return WsResponse::error(format!("Invalid entity ID: {}", e)),
-            };
-
-            let scope = match handle.get_scope(subject_id, entity_id_parsed, qlib_rs::FieldType(0)).await {
+            let scope = match handle.get_scope(subject_id, entity_id, qlib_rs::FieldType(0)).await {
                 Ok(s) => s,
                 Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
             };
@@ -476,7 +383,7 @@ async fn handle_ws_request(
                 return WsResponse::error("Access denied".to_string());
             }
 
-            match handle.delete_entity(entity_id_parsed).await {
+            match handle.delete_entity(entity_id).await {
                 Ok(_) => WsResponse::success(serde_json::json!({
                     "message": "Successfully deleted entity"
                 })),
@@ -490,14 +397,9 @@ async fn handle_ws_request(
                 None => return WsResponse::error("Authentication required".to_string()),
             };
 
-            let et = match handle.get_entity_type(&entity_type).await {
-                Ok(et) => et,
-                Err(e) => return WsResponse::error(format!("Failed to get entity type: {:?}", e)),
-            };
-
-            match handle.find_entities(et, filter.as_deref()).await {
+            match handle.find_entities(entity_type, filter.as_deref()).await {
                 Ok(entity_ids) => WsResponse::success(serde_json::json!({
-                    "entities": entity_ids.iter().map(|id| id.0.to_string()).collect::<Vec<_>>()
+                    "entities": entity_ids
                 })),
                 Err(e) => WsResponse::error(format!("Failed to find entities: {:?}", e)),
             }
@@ -561,167 +463,68 @@ async fn handle_ws_request(
             }
         }
         WsRequest::Schema { entity_type } => {
-            let et = match handle.get_entity_type(&entity_type).await {
-                Ok(et) => et,
-                Err(e) => return WsResponse::error(format!("Failed to get entity type: {:?}", e)),
-            };
-            match handle.get_entity_schema(et).await {
+            match handle.get_entity_schema(entity_type).await {
                 Ok(schema) => {
-                    // Convert schema to EntitySchemaModel
-                    let et_name = handle.resolve_entity_type(et).await.ok();
-                    let entity_type_model = crate::models::EntityTypeModel { id: et.0.to_string(), name: et_name.unwrap_or(et.0.to_string()) };
-
-                    let mut fields = Vec::new();
-                    for (ft, fs) in schema.fields.iter() {
-                        let ft_name = handle.resolve_field_type(*ft).await.ok();
-                        let field_type_model = crate::models::FieldTypeModel { id: ft.0.to_string(), name: ft_name.unwrap_or(ft.0.to_string()) };
-                        let default_value = serde_json::to_value(&fs.default_value()).unwrap_or(serde_json::Value::Null);
-                        fields.push(crate::models::FieldSchemaModel { field_type: field_type_model, rank: fs.rank(), default_value });
-                    }
-
-                    let schema_model = crate::models::EntitySchemaModel { entity_type: entity_type_model, inherit: Vec::new(), fields };
                     WsResponse::success(serde_json::json!({
-                        "entity_type": entity_type,
-                        "schema": schema_model
+                        "schema": schema
                     }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to get schema: {:?}", e)),
             }
         }
         WsRequest::CompleteSchema { entity_type } => {
-            let et = match handle.get_entity_type(&entity_type).await {
-                Ok(et) => et,
-                Err(e) => return WsResponse::error(format!("Failed to get entity type: {:?}", e)),
-            };
-            match handle.get_complete_entity_schema(et).await {
+            match handle.get_complete_entity_schema(entity_type).await {
                 Ok(schema) => {
-                    let et_name = handle.resolve_entity_type(et).await.ok();
-                    let entity_type_model = crate::models::EntityTypeModel { id: et.0.to_string(), name: et_name.unwrap_or(et.0.to_string()) };
-
-                    let mut fields = Vec::new();
-                    for (ft, fs) in schema.fields.iter() {
-                        let ft_name = handle.resolve_field_type(*ft).await.ok();
-                        let field_type_model = crate::models::FieldTypeModel { id: ft.0.to_string(), name: ft_name.unwrap_or(ft.0.to_string()) };
-                        let default_value = serde_json::to_value(&fs.default_value()).unwrap_or(serde_json::Value::Null);
-                        fields.push(crate::models::FieldSchemaModel { field_type: field_type_model, rank: fs.rank(), default_value });
-                    }
-
-                    let schema_model = crate::models::EntitySchemaModel { entity_type: entity_type_model, inherit: Vec::new(), fields };
                     WsResponse::success(serde_json::json!({
-                        "entity_type": entity_type,
-                        "schema": schema_model
+                        "schema": schema
                     }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to get complete schema: {:?}", e)),
             }
         }
         WsRequest::ResolveEntityType { entity_type } => {
-            let et = match entity_type.parse::<u32>() {
-                Ok(et) => et,
-                Err(e) => return WsResponse::error(format!("Invalid entity type: {}", e)),
-            };
-
-            match handle.resolve_entity_type(qlib_rs::EntityType(et)).await {
+            match handle.resolve_entity_type(entity_type).await {
                 Ok(name) => WsResponse::success(serde_json::json!({
-                    "entity_type": entity_type,
                     "name": name
                 })),
                 Err(e) => WsResponse::error(format!("Failed to resolve entity type: {:?}", e)),
             }
         }
         WsRequest::ResolveFieldType { field_type } => {
-            let ft = match field_type.parse::<u64>() {
-                Ok(ft) => ft,
-                Err(e) => return WsResponse::error(format!("Invalid field type: {}", e)),
-            };
-
-            match handle.resolve_field_type(qlib_rs::FieldType(ft)).await {
+            match handle.resolve_field_type(field_type).await {
                 Ok(name) => WsResponse::success(serde_json::json!({
-                    "field_type": field_type,
                     "name": name
                 })),
                 Err(e) => WsResponse::error(format!("Failed to resolve field type: {:?}", e)),
             }
         }
         WsRequest::GetFieldSchema { entity_type, field_type } => {
-            let et = match entity_type.parse::<u32>() {
-                Ok(et) => et,
-                Err(e) => return WsResponse::error(format!("Invalid entity type: {}", e)),
-            };
-
-            let ft = match field_type.parse::<u64>() {
-                Ok(ft) => ft,
-                Err(e) => return WsResponse::error(format!("Invalid field type: {}", e)),
-            };
-
-            match handle.get_field_schema(qlib_rs::EntityType(et), qlib_rs::FieldType(ft)).await {
+            match handle.get_field_schema(entity_type, field_type).await {
                 Ok(schema) => {
-                    let ft_name = handle.resolve_field_type(qlib_rs::FieldType(ft)).await.ok();
-                    let field_schema_model = crate::models::FieldSchemaModel {
-                        field_type: crate::models::FieldTypeModel { id: ft.to_string(), name: ft_name.unwrap_or(ft.to_string()) },
-                        rank: schema.rank(),
-                        default_value: serde_json::to_value(&schema.default_value()).unwrap_or(serde_json::Value::Null),
-                    };
                     WsResponse::success(serde_json::json!({
-                        "entity_type": entity_type,
-                        "field_type": field_type,
-                        "schema": field_schema_model
+                        "schema": schema
                     }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to get field schema: {:?}", e)),
             }
         }
         WsRequest::EntityExists { entity_id } => {
-            let eid = match entity_id.parse::<u64>() {
-                Ok(id) => qlib_rs::EntityId(id),
-                Err(e) => return WsResponse::error(format!("Invalid entity ID: {}", e)),
-            };
-
-            let exists = handle.entity_exists(eid).await;
-
+            let exists = handle.entity_exists(entity_id).await;
             WsResponse::success(serde_json::json!({
-                "entity_id": entity_id,
                 "exists": exists
             }))
         }
         WsRequest::FieldExists { entity_type, field_type } => {
-            let et = match entity_type.parse::<u32>() {
-                Ok(et) => et,
-                Err(e) => return WsResponse::error(format!("Invalid entity type: {}", e)),
-            };
-
-            let ft = match field_type.parse::<u64>() {
-                Ok(ft) => ft,
-                Err(e) => return WsResponse::error(format!("Invalid field type: {}", e)),
-            };
-
-            let exists = handle.field_exists(qlib_rs::EntityType(et), qlib_rs::FieldType(ft)).await;
-
+            let exists = handle.field_exists(entity_type, field_type).await;
             WsResponse::success(serde_json::json!({
-                "entity_type": entity_type,
-                "field_type": field_type,
                 "exists": exists
             }))
         }
         WsRequest::ResolveIndirection { entity_id, fields } => {
-            let eid = match entity_id.parse::<u64>() {
-                Ok(id) => qlib_rs::EntityId(id),
-                Err(e) => return WsResponse::error(format!("Invalid entity ID: {}", e)),
-            };
-
-            let mut field_types = Vec::new();
-            for field_name in &fields {
-                match resolve_field_identifier(handle, field_name).await {
-                    Ok(ft) => field_types.push(ft),
-                    Err(e) => return WsResponse::error(e),
-                }
-            }
-
-            match handle.resolve_indirection(eid, &field_types).await {
+            match handle.resolve_indirection(entity_id, &fields).await {
                 Ok((resolved_entity_id, resolved_field_type)) => WsResponse::success(serde_json::json!({
-                    "entity_id": entity_id,
-                    "resolved_entity_id": resolved_entity_id.0.to_string(),
-                    "resolved_field_type": resolved_field_type.0.to_string()
+                    "resolved_entity_id": resolved_entity_id,
+                    "resolved_field_type": resolved_field_type
                 })),
                 Err(e) => WsResponse::error(format!("Failed to resolve indirection: {:?}", e)),
             }
@@ -729,81 +532,20 @@ async fn handle_ws_request(
     }
 }
 
-fn json_to_qlib_value(json: &serde_json::Value) -> Result<qlib_rs::Value, String> {
-    use qlib_rs::Value;
-    
-    match json {
-        serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Value::Int(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(Value::Float(f))
-            } else {
-                Err("Invalid number".to_string())
-            }
-        }
-        serde_json::Value::String(s) => {
-            if let Ok(id) = s.parse::<u64>() {
-                Ok(Value::EntityReference(Some(qlib_rs::EntityId(id))))
-            } else {
-                Ok(Value::String(s.clone()))
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            let ids: Result<Vec<qlib_rs::EntityId>, _> = arr
-                .iter()
-                .map(|v| {
-                    if let serde_json::Value::String(s) = v {
-                        s.parse::<u64>().map(qlib_rs::EntityId).map_err(|_| "Invalid entity ID")
-                    } else {
-                        Err("Invalid entity ID")
-                    }
-                })
-                .collect();
-            match ids {
-                Ok(entity_ids) => Ok(Value::EntityList(entity_ids)),
-                Err(e) => Err(format!("Array must contain valid entity IDs: {}", e)),
-            }
-        }
-        serde_json::Value::Null => Ok(Value::EntityReference(None)),
-        _ => Err("Unsupported JSON type".to_string()),
-    }
-}
-
-async fn config_to_notify_config(config: &crate::models::NotifyConfigModel, handle: &StoreHandle) -> Result<qlib_rs::NotifyConfig, String> {
-    let field_type = resolve_field_identifier(handle, &config.field).await?;
-
-    let mut context = Vec::new();
-    for path in &config.context {
-        let mut path_types = Vec::new();
-        for field_name in path {
-            let ft = resolve_field_identifier(handle, field_name).await?;
-            path_types.push(ft);
-        }
-        context.push(path_types);
-    }
-
-    if let Some(entity_id_str) = &config.entity_id {
-        let entity_id = entity_id_str.parse::<u64>()
-            .map(qlib_rs::EntityId)
-            .map_err(|_| "Invalid entity ID")?;
-        Ok(qlib_rs::NotifyConfig::EntityId {
-            entity_id,
-            field_type,
+async fn config_to_notify_config(config: &crate::models::NotifyConfigModel, _handle: &StoreHandle) -> Result<qlib_rs::NotifyConfig, String> {
+    match (&config.entity_id, &config.entity_type) {
+        (Some(entity_id), _) => Ok(qlib_rs::NotifyConfig::EntityId {
+            entity_id: *entity_id,
+            field_type: config.field,
             trigger_on_change: config.trigger_on_change,
-            context,
-        })
-    } else if let Some(entity_type_str) = &config.entity_type {
-        let entity_type = handle.get_entity_type(entity_type_str).await
-            .map_err(|e| format!("Failed to get entity type: {:?}", e))?;
-        Ok(qlib_rs::NotifyConfig::EntityType {
-            entity_type,
-            field_type,
+            context: config.context.clone(),
+        }),
+        (_, Some(entity_type)) => Ok(qlib_rs::NotifyConfig::EntityType {
+            entity_type: *entity_type,
+            field_type: config.field,
             trigger_on_change: config.trigger_on_change,
-            context,
-        })
-    } else {
-        Err("Either entity_id or entity_type must be provided".to_string())
+            context: config.context.clone(),
+        }),
+        _ => Err(format!("Either entity_id or entity_type must be set")),
     }
 }
