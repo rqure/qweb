@@ -1,4 +1,4 @@
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{rt, web, HttpRequest, HttpResponse};
 use actix_ws::Message;
 use futures_util::StreamExt;
 use log::{error, info};
@@ -95,11 +95,8 @@ pub async fn ws_handler(
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body)?;
-    
-    info!("WebSocket connection established");
 
     let handle = state.store_handle.clone();
-
     let (subject_id, ws_session_id) = match crate::handlers::get_subject_and_session_from_request(&req, &state.jwt_secret, &handle).await {
         Ok((uid, sid)) => {
             // Verify session ownership
@@ -117,109 +114,113 @@ pub async fn ws_handler(
         }
         Err(_) => (None, None),
     };
+    
+    rt::spawn(async move {
+        info!("WebSocket connection established");
 
         // Create channels for notifications
-    let (crossbeam_sender, crossbeam_receiver) = channel::unbounded::<qlib_rs::Notification>();
-    let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<qlib_rs::Notification>();
+        let (crossbeam_sender, crossbeam_receiver) = channel::unbounded::<qlib_rs::Notification>();
+        let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<qlib_rs::Notification>();
 
-    // Track registered configs
-    let mut registered_configs: HashMap<qlib_rs::NotifyConfig, ()> = HashMap::new();
+        // Track registered configs
+        let mut registered_configs: HashMap<qlib_rs::NotifyConfig, ()> = HashMap::new();
 
-    // Spawn task to forward notifications to WebSocket
-    let mut session_clone = session.clone();
-    tokio::spawn(async move {
-        while let Some(notification) = tokio_receiver.recv().await {
-            let notification_json = serde_json::to_string(&WsResponse::success(serde_json::json!({
-                "type": "notification",
-                "notification": notification
-            }))).unwrap();
-            if let Err(e) = session_clone.text(notification_json).await {
-                error!("Failed to send notification: {}", e);
-                break;
+        // Spawn task to forward notifications to WebSocket
+        let mut session_clone = session.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = tokio_receiver.recv().await {
+                let notification_json = serde_json::to_string(&WsResponse::success(serde_json::json!({
+                    "type": "notification",
+                    "notification": notification
+                }))).unwrap();
+                if let Err(e) = session_clone.text(notification_json).await {
+                    error!("Failed to send notification: {}", e);
+                    break;
+                }
             }
-        }
-    });
+        });
 
-    // Spawn task to poll for notifications from crossbeam and send to tokio
-    tokio::spawn(async move {
-        loop {
-            match crossbeam_receiver.try_recv() {
-                Ok(notification) => {
-                    if tokio_sender.send(notification).is_err() {
+        // Spawn task to poll for notifications from crossbeam and send to tokio
+        tokio::spawn(async move {
+            loop {
+                match crossbeam_receiver.try_recv() {
+                    Ok(notification) => {
+                        if tokio_sender.send(notification).is_err() {
+                            break;
+                        }
+                    }
+                    Err(crossbeam::channel::TryRecvError::Empty) => {
+                        // No notification available, sleep briefly
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        // Channel disconnected, exit
                         break;
                     }
                 }
-                Err(crossbeam::channel::TryRecvError::Empty) => {
-                    // No notification available, sleep briefly
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                Err(crossbeam::channel::TryRecvError::Disconnected) => {
-                    // Channel disconnected, exit
-                    break;
-                }
             }
-        }
-    });
+        });
 
-    while let Some(Ok(msg)) = msg_stream.next().await {
-        match msg {
-            Message::Text(text) => {
-                let response = match serde_json::from_str::<WsRequest>(&text) {
-                    Ok(request) => {
-                        handle_ws_request(request, &handle, &crossbeam_sender, &mut registered_configs, subject_id, ws_session_id).await
+        while let Some(Ok(msg)) = msg_stream.next().await {
+            match msg {
+                Message::Text(text) => {
+                    let response = match serde_json::from_str::<WsRequest>(&text) {
+                        Ok(request) => {
+                            handle_ws_request(request, &handle, &crossbeam_sender, &mut registered_configs, subject_id, ws_session_id).await
+                        }
+                        Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
+                    };
+
+                    let response_json = serde_json::to_string(&response).unwrap();
+                    if let Err(e) = session.text(response_json).await {
+                        error!("Failed to send WebSocket response: {}", e);
+                        break;
                     }
-                    Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
-                };
-
-                let response_json = serde_json::to_string(&response).unwrap();
-                if let Err(e) = session.text(response_json).await {
-                    error!("Failed to send WebSocket response: {}", e);
+                }
+                Message::Ping(bytes) => {
+                    if let Err(e) = session.pong(&bytes).await {
+                        error!("Failed to send pong: {}", e);
+                        break;
+                    }
+                }
+                Message::Close(_) => {
+                    info!("WebSocket connection closed by client");
                     break;
                 }
+                _ => {}
             }
-            Message::Ping(bytes) => {
-                if let Err(e) = session.pong(&bytes).await {
-                    error!("Failed to send pong: {}", e);
-                    break;
-                }
-            }
-            Message::Close(_) => {
-                info!("WebSocket connection closed by client");
-                break;
-            }
-            _ => {}
         }
-    }
 
-    // Unregister all notifications on disconnect
-    for config in registered_configs.keys() {
-        let _ = handle.unregister_notification(config.clone(), crossbeam_sender.clone()).await;
-    }
+        // Unregister all notifications on disconnect
+        for config in registered_configs.keys() {
+            let _ = handle.unregister_notification(config.clone(), crossbeam_sender.clone()).await;
+        }
 
-    // Auto-logout: Clear session on disconnect
-    if let Some(ws_session_id) = ws_session_id {
-        info!("WebSocket disconnected, auto-logging out session: {:?}", ws_session_id);
-        
-        // Get field types
-        if let (Ok(current_user_ft), Ok(previous_user_ft), Ok(token_ft), Ok(expires_at_ft)) = (
-            handle.get_field_type("CurrentUser").await,
-            handle.get_field_type("PreviousUser").await,
-            handle.get_field_type("Token").await,
-            handle.get_field_type("ExpiresAt").await,
-        ) {
-            // Save CurrentUser to PreviousUser
-            if let Ok((qlib_rs::Value::EntityReference(Some(user_id)), _, _)) = handle.read(ws_session_id, &[current_user_ft]).await {
-                let _ = handle.write(ws_session_id, &[previous_user_ft], qlib_rs::Value::EntityReference(Some(user_id)), None, None, None, None).await;
-            }
+        // Auto-logout: Clear session on disconnect
+        if let Some(ws_session_id) = ws_session_id {
+            info!("WebSocket disconnected, auto-logging out session: {:?}", ws_session_id);
             
-            // Clear the session
-            let _ = handle.write(ws_session_id, &[current_user_ft], qlib_rs::Value::EntityReference(None), None, None, None, None).await;
-            let _ = handle.write(ws_session_id, &[token_ft], qlib_rs::Value::String("".to_string()), None, None, None, None).await;
-            let _ = handle.write(ws_session_id, &[expires_at_ft], qlib_rs::Value::Timestamp(qlib_rs::epoch()), None, None, None, None).await;
+            // Get field types
+            if let (Ok(current_user_ft), Ok(previous_user_ft), Ok(token_ft), Ok(expires_at_ft)) = (
+                handle.get_field_type("CurrentUser").await,
+                handle.get_field_type("PreviousUser").await,
+                handle.get_field_type("Token").await,
+                handle.get_field_type("ExpiresAt").await,
+            ) {
+                // Save CurrentUser to PreviousUser
+                if let Ok((qlib_rs::Value::EntityReference(Some(user_id)), _, _)) = handle.read(ws_session_id, &[current_user_ft]).await {
+                    let _ = handle.write(ws_session_id, &[previous_user_ft], qlib_rs::Value::EntityReference(Some(user_id)), None, None, None, None).await;
+                }
+                
+                // Clear the session
+                let _ = handle.write(ws_session_id, &[current_user_ft], qlib_rs::Value::EntityReference(None), None, None, None, None).await;
+                let _ = handle.write(ws_session_id, &[token_ft], qlib_rs::Value::String("".to_string()), None, None, None, None).await;
+                let _ = handle.write(ws_session_id, &[expires_at_ft], qlib_rs::Value::Timestamp(qlib_rs::epoch()), None, None, None, None).await;
+            }
         }
-    }
 
-    info!("WebSocket connection terminated");
+        info!("WebSocket connection terminated");
+    });
 
     Ok(response)
 }
