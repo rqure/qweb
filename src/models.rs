@@ -185,3 +185,58 @@ impl<T> ApiResponse<T> {
         }
     }
 }
+
+    // ---------------------------------------------------------------------------
+    // Notification models
+    // ---------------------------------------------------------------------------
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct NotifyConfigModel {
+        pub entity_id: Option<String>,
+        pub entity_type: Option<String>,
+        pub field: String,
+        pub trigger_on_change: bool,
+        pub context: Vec<Vec<String>>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct NotifyInfoModel {
+        pub entity_id: Option<String>,
+        /// Field path represented as a list of field type IDs (as strings) for indirection
+        pub field_path: Vec<String>,
+        /// Value serialized the same way qweb sends values (e.g. {"Int": 42} / {"String": "x"})
+        pub value: Option<serde_json::Value>,
+        /// Timestamp may be represented as either an ISO string or an object with secs/nanos
+        pub timestamp: Option<serde_json::Value>,
+        pub writer_id: Option<String>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct NotificationModel {
+        pub current: NotifyInfoModel,
+        pub previous: NotifyInfoModel,
+        /// Context map where the key is a comma-separated list of field type IDs
+        pub context: std::collections::BTreeMap<String, NotifyInfoModel>,
+        pub config_hash: u64,
+        /// Optionally include the original notify config so clients can easily match callbacks
+        pub config: Option<NotifyConfigModel>,
+    }
+
+    // ---------------------------------------------------------------------------
+    // Schema models
+    // ---------------------------------------------------------------------------
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct FieldSchemaModel {
+        pub field_type: FieldTypeModel,
+        pub rank: i64,
+        /// Default value encoded as qweb values (variant object form)
+        pub default_value: serde_json::Value,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct EntitySchemaModel {
+        pub entity_type: EntityTypeModel,
+        pub inherit: Vec<EntityTypeModel>,
+        pub fields: Vec<FieldSchemaModel>,
+    }

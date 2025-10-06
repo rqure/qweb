@@ -548,14 +548,23 @@ pub async fn schema(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
 
     match handle.get_entity_schema(entity_type).await {
         Ok(schema) => {
-            match serde_json::to_value(&schema) {
-                Ok(schema_json) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-                    "entity_type": body.entity_type,
-                    "schema": schema_json
-                }))),
-                Err(e) => HttpResponse::InternalServerError()
-                    .json(ApiResponse::<()>::error(format!("Failed to serialize schema: {:?}", e))),
+            // Build EntitySchemaModel for JSON-friendly response
+            let et_name = handle.resolve_entity_type(entity_type).await.ok();
+            let entity_type_model = EntityTypeModel { id: entity_type.0.to_string(), name: et_name.unwrap_or(entity_type.0.to_string()) };
+
+            let mut fields = Vec::new();
+            for (ft, fs) in schema.fields.iter() {
+                let ft_name = handle.resolve_field_type(*ft).await.ok();
+                let field_type_model = FieldTypeModel { id: ft.0.to_string(), name: ft_name.unwrap_or(ft.0.to_string()) };
+                let default_value = serde_json::to_value(&fs.default_value()).unwrap_or(serde_json::Value::Null);
+                fields.push(crate::models::FieldSchemaModel { field_type: field_type_model, rank: fs.rank(), default_value });
             }
+
+            let schema_model = crate::models::EntitySchemaModel { entity_type: entity_type_model, inherit: Vec::new(), fields };
+            HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+                "entity_type": body.entity_type,
+                "schema": schema_model
+            })))
         }
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to get schema: {:?}", e))),
@@ -577,17 +586,22 @@ pub async fn complete_schema(req: HttpRequest, state: web::Data<AppState>, body:
 
     match handle.get_complete_entity_schema(entity_type).await {
         Ok(schema) => {
-            match serde_json::to_value(&schema) {
-                Ok(schema_json) => {
-                    let et_name = handle.resolve_entity_type(entity_type).await.ok();
-                    HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-                        "entity_type": { "id": entity_type.0.to_string(), "name": et_name },
-                        "schema": schema_json
-                    })))
-                }
-                Err(e) => HttpResponse::InternalServerError()
-                    .json(ApiResponse::<()>::error(format!("Failed to serialize schema: {:?}", e))),
+            let et_name = handle.resolve_entity_type(entity_type).await.ok();
+            let entity_type_model = EntityTypeModel { id: entity_type.0.to_string(), name: et_name.unwrap_or(entity_type.0.to_string()) };
+
+            let mut fields = Vec::new();
+            for (ft, fs) in schema.fields.iter() {
+                let ft_name = handle.resolve_field_type(*ft).await.ok();
+                let field_type_model = FieldTypeModel { id: ft.0.to_string(), name: ft_name.unwrap_or(ft.0.to_string()) };
+                let default_value = serde_json::to_value(&fs.default_value()).unwrap_or(serde_json::Value::Null);
+                fields.push(crate::models::FieldSchemaModel { field_type: field_type_model, rank: fs.rank(), default_value });
             }
+
+            let schema_model = crate::models::EntitySchemaModel { entity_type: entity_type_model.clone(), inherit: Vec::new(), fields };
+            HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+                "entity_type": { "id": entity_type_model.id, "name": entity_type_model.name },
+                "schema": schema_model
+            })))
         }
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to get complete schema: {:?}", e))),
@@ -660,11 +674,19 @@ pub async fn get_field_schema(req: HttpRequest, state: web::Data<AppState>, body
     };
 
     match handle.get_field_schema(entity_type, field_type).await {
-        Ok(schema) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
-            "entity_type": body.entity_type,
-            "field_type": body.field_type,
-            "schema": format!("{:?}", schema)
-        }))),
+        Ok(schema) => {
+            let ft_name = handle.resolve_field_type(field_type).await.ok();
+            let field_schema_model = crate::models::FieldSchemaModel {
+                field_type: FieldTypeModel { id: field_type.0.to_string(), name: ft_name.unwrap_or(field_type.0.to_string()) },
+                rank: schema.rank(),
+                default_value: serde_json::to_value(&schema.default_value()).unwrap_or(serde_json::Value::Null),
+            };
+            HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+                "entity_type": body.entity_type,
+                "field_type": body.field_type,
+                "schema": field_schema_model
+            })))
+        }
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to get field schema: {:?}", e))),
     }

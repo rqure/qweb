@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use crossbeam::channel;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::store_service::StoreHandle;
 use crate::AppState;
@@ -43,14 +45,8 @@ async fn check_websocket_session_ownership(
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct NotifyConfigJson {
-    pub entity_id: Option<String>, // For EntityId variant
-    pub entity_type: Option<String>, // For EntityType variant
-    pub field: String,
-    pub trigger_on_change: bool,
-    pub context: Vec<Vec<String>>, // Context fields as field names
-}
+// Use shared model defined in crate::models for notification configuration
+// (crate::models::NotifyConfigModel)
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -60,8 +56,8 @@ enum WsRequest {
     Create { entity_type: String, name: String },
     Delete { entity_id: String },
     Find { entity_type: String, filter: Option<String> },
-    RegisterNotification { config: NotifyConfigJson },
-    UnregisterNotification { config: NotifyConfigJson },
+    RegisterNotification { config: crate::models::NotifyConfigModel },
+    UnregisterNotification { config: crate::models::NotifyConfigModel },
     Schema { entity_type: String },
     CompleteSchema { entity_type: String },
     ResolveEntityType { entity_type: String },
@@ -129,20 +125,23 @@ pub async fn ws_handler(
     rt::spawn(async move {
         info!("WebSocket connection established");
 
-        // Create channels for notifications
+        // Create channels for notifications: crossbeam receives qlib notifications from store
+        // while tokio channel carries our JSON-friendly NotificationModel to the WebSocket
         let (crossbeam_sender, crossbeam_receiver) = channel::unbounded::<qlib_rs::Notification>();
-        let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<qlib_rs::Notification>();
+        let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<crate::models::NotificationModel>();
 
-        // Track registered configs
-        let mut registered_configs: HashMap<qlib_rs::NotifyConfig, ()> = HashMap::new();
+        // Track registered configs by config_hash so we can attach the original config to
+        // outgoing notifications. We keep both the qlib config (for unregistering) and
+        // the incoming model for client consumption.
+        let registered_configs: Arc<RwLock<HashMap<u64, (qlib_rs::NotifyConfig, crate::models::NotifyConfigModel)>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        // Spawn task to forward notifications to WebSocket
+        // Spawn task to forward NotificationModel objects to the WebSocket
         let mut session_clone = session.clone();
         tokio::spawn(async move {
-            while let Some(notification) = tokio_receiver.recv().await {
+            while let Some(notification_model) = tokio_receiver.recv().await {
                 let notification_json = serde_json::to_string(&WsResponse::success(serde_json::json!({
                     "type": "notification",
-                    "notification": notification
+                    "notification": notification_model
                 }))).unwrap();
                 if let Err(e) = session_clone.text(notification_json).await {
                     error!("Failed to send notification: {}", e);
@@ -151,21 +150,52 @@ pub async fn ws_handler(
             }
         });
 
-        // Spawn task to poll for notifications from crossbeam and send to tokio
+        // Spawn task to poll for qlib notifications from crossbeam, map them to
+        // NotificationModel and send to the tokio channel.
+        let registered_configs_clone = registered_configs.clone();
         tokio::spawn(async move {
             loop {
                 match crossbeam_receiver.try_recv() {
                     Ok(notification) => {
-                        if tokio_sender.send(notification).is_err() {
+                        // Map qlib notification into our model, attaching the registered config if present
+                        let config_opt = {
+                            let map = registered_configs_clone.read().await;
+                            map.get(&notification.config_hash).map(|(_, m)| m.clone())
+                        };
+
+                        // Convert NotifyInfo -> NotifyInfoModel
+                        let map_notify_info = |info: &qlib_rs::NotifyInfo| -> crate::models::NotifyInfoModel {
+                            crate::models::NotifyInfoModel {
+                                entity_id: Some(info.entity_id.0.to_string()),
+                                field_path: info.field_path.iter().map(|ft| ft.0.to_string()).collect(),
+                                value: info.value.clone().map(|v| serde_json::to_value(&v).unwrap_or(serde_json::Value::Null)),
+                                timestamp: info.timestamp.clone().map(|t| serde_json::to_value(&t).unwrap_or(serde_json::Value::String("".to_string()))),
+                                writer_id: info.writer_id.map(|wid| wid.0.to_string()),
+                            }
+                        };
+
+                        let mut ctx = std::collections::BTreeMap::new();
+                        for (key_vec, info) in notification.context.iter() {
+                            let key_str = key_vec.iter().map(|ft| ft.0.to_string()).collect::<Vec<_>>().join(",");
+                            ctx.insert(key_str, map_notify_info(info));
+                        }
+
+                        let notification_model = crate::models::NotificationModel {
+                            current: map_notify_info(&notification.current),
+                            previous: map_notify_info(&notification.previous),
+                            context: ctx,
+                            config_hash: notification.config_hash,
+                            config: config_opt,
+                        };
+
+                        if tokio_sender.send(notification_model).is_err() {
                             break;
                         }
                     }
                     Err(crossbeam::channel::TryRecvError::Empty) => {
-                        // No notification available, sleep briefly
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                     Err(crossbeam::channel::TryRecvError::Disconnected) => {
-                        // Channel disconnected, exit
                         break;
                     }
                 }
@@ -177,7 +207,7 @@ pub async fn ws_handler(
                 Message::Text(text) => {
                     let response = match serde_json::from_str::<WsRequest>(&text) {
                         Ok(request) => {
-                            handle_ws_request(request, &handle, &crossbeam_sender, &mut registered_configs, subject_id, ws_session_id).await
+                            handle_ws_request(request, &handle, &crossbeam_sender, &registered_configs, subject_id, ws_session_id).await
                         }
                         Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
                     };
@@ -203,8 +233,11 @@ pub async fn ws_handler(
         }
 
         // Unregister all notifications on disconnect
-        for config in registered_configs.keys() {
-            let _ = handle.unregister_notification(config.clone(), crossbeam_sender.clone()).await;
+        {
+            let map = registered_configs.read().await;
+            for (_hash, (qlib_config, _model)) in map.iter() {
+                let _ = handle.unregister_notification(qlib_config.clone(), crossbeam_sender.clone()).await;
+            }
         }
 
         // Auto-logout: Clear session on disconnect
@@ -240,7 +273,7 @@ async fn handle_ws_request(
     request: WsRequest,
     handle: &StoreHandle,
     notification_sender: &channel::Sender<qlib_rs::Notification>,
-    registered_configs: &mut HashMap<qlib_rs::NotifyConfig, ()>,
+    registered_configs: &Arc<RwLock<HashMap<u64, (qlib_rs::NotifyConfig, crate::models::NotifyConfigModel)>>>,
     subject_id: Option<qlib_rs::EntityId>,
     session_id: Option<qlib_rs::EntityId>,
 ) -> WsResponse {
@@ -474,15 +507,20 @@ async fn handle_ws_request(
                 Some(id) => id,
                 None => return WsResponse::error("Authentication required".to_string()),
             };
-
             match config_to_notify_config(&config, handle).await {
                 Ok(notify_config) => {
-                    if registered_configs.contains_key(&notify_config) {
-                        return WsResponse::error("Notification already registered".to_string());
+                    let config_hash = qlib_rs::hash_notify_config(&notify_config);
+                    {
+                        let map = registered_configs.read().await;
+                        if map.contains_key(&config_hash) {
+                            return WsResponse::error("Notification already registered".to_string());
+                        }
                     }
+
                     match handle.register_notification(notify_config.clone(), notification_sender.clone()).await {
                         Ok(_) => {
-                            registered_configs.insert(notify_config, ());
+                            let mut map = registered_configs.write().await;
+                            map.insert(config_hash, (notify_config.clone(), config.clone()));
                             WsResponse::success(serde_json::json!({
                                 "message": "Notification registered"
                             }))
@@ -498,15 +536,20 @@ async fn handle_ws_request(
                 Some(id) => id,
                 None => return WsResponse::error("Authentication required".to_string()),
             };
-
             match config_to_notify_config(&config, handle).await {
                 Ok(notify_config) => {
-                    if !registered_configs.contains_key(&notify_config) {
-                        return WsResponse::error("Notification not registered".to_string());
+                    let config_hash = qlib_rs::hash_notify_config(&notify_config);
+                    {
+                        let map = registered_configs.read().await;
+                        if !map.contains_key(&config_hash) {
+                            return WsResponse::error("Notification not registered".to_string());
+                        }
                     }
+
                     match handle.unregister_notification(notify_config.clone(), notification_sender.clone()).await {
                         Ok(_) => {
-                            registered_configs.remove(&notify_config);
+                            let mut map = registered_configs.write().await;
+                            map.remove(&config_hash);
                             WsResponse::success(serde_json::json!({
                                 "message": "Notification unregistered"
                             }))
@@ -522,16 +565,25 @@ async fn handle_ws_request(
                 Ok(et) => et,
                 Err(e) => return WsResponse::error(format!("Failed to get entity type: {:?}", e)),
             };
-
             match handle.get_entity_schema(et).await {
                 Ok(schema) => {
-                    match serde_json::to_value(&schema) {
-                        Ok(schema_json) => WsResponse::success(serde_json::json!({
-                            "entity_type": entity_type,
-                            "schema": schema_json
-                        })),
-                        Err(e) => WsResponse::error(format!("Failed to serialize schema: {:?}", e)),
+                    // Convert schema to EntitySchemaModel
+                    let et_name = handle.resolve_entity_type(et).await.ok();
+                    let entity_type_model = crate::models::EntityTypeModel { id: et.0.to_string(), name: et_name.unwrap_or(et.0.to_string()) };
+
+                    let mut fields = Vec::new();
+                    for (ft, fs) in schema.fields.iter() {
+                        let ft_name = handle.resolve_field_type(*ft).await.ok();
+                        let field_type_model = crate::models::FieldTypeModel { id: ft.0.to_string(), name: ft_name.unwrap_or(ft.0.to_string()) };
+                        let default_value = serde_json::to_value(&fs.default_value()).unwrap_or(serde_json::Value::Null);
+                        fields.push(crate::models::FieldSchemaModel { field_type: field_type_model, rank: fs.rank(), default_value });
                     }
+
+                    let schema_model = crate::models::EntitySchemaModel { entity_type: entity_type_model, inherit: Vec::new(), fields };
+                    WsResponse::success(serde_json::json!({
+                        "entity_type": entity_type,
+                        "schema": schema_model
+                    }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to get schema: {:?}", e)),
             }
@@ -541,16 +593,24 @@ async fn handle_ws_request(
                 Ok(et) => et,
                 Err(e) => return WsResponse::error(format!("Failed to get entity type: {:?}", e)),
             };
-
             match handle.get_complete_entity_schema(et).await {
                 Ok(schema) => {
-                    match serde_json::to_value(&schema) {
-                        Ok(schema_json) => WsResponse::success(serde_json::json!({
-                            "entity_type": entity_type,
-                            "schema": schema_json
-                        })),
-                        Err(e) => WsResponse::error(format!("Failed to serialize schema: {:?}", e)),
+                    let et_name = handle.resolve_entity_type(et).await.ok();
+                    let entity_type_model = crate::models::EntityTypeModel { id: et.0.to_string(), name: et_name.unwrap_or(et.0.to_string()) };
+
+                    let mut fields = Vec::new();
+                    for (ft, fs) in schema.fields.iter() {
+                        let ft_name = handle.resolve_field_type(*ft).await.ok();
+                        let field_type_model = crate::models::FieldTypeModel { id: ft.0.to_string(), name: ft_name.unwrap_or(ft.0.to_string()) };
+                        let default_value = serde_json::to_value(&fs.default_value()).unwrap_or(serde_json::Value::Null);
+                        fields.push(crate::models::FieldSchemaModel { field_type: field_type_model, rank: fs.rank(), default_value });
                     }
+
+                    let schema_model = crate::models::EntitySchemaModel { entity_type: entity_type_model, inherit: Vec::new(), fields };
+                    WsResponse::success(serde_json::json!({
+                        "entity_type": entity_type,
+                        "schema": schema_model
+                    }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to get complete schema: {:?}", e)),
             }
@@ -595,11 +655,19 @@ async fn handle_ws_request(
             };
 
             match handle.get_field_schema(qlib_rs::EntityType(et), qlib_rs::FieldType(ft)).await {
-                Ok(schema) => WsResponse::success(serde_json::json!({
-                    "entity_type": entity_type,
-                    "field_type": field_type,
-                    "schema": format!("{:?}", schema)
-                })),
+                Ok(schema) => {
+                    let ft_name = handle.resolve_field_type(qlib_rs::FieldType(ft)).await.ok();
+                    let field_schema_model = crate::models::FieldSchemaModel {
+                        field_type: crate::models::FieldTypeModel { id: ft.to_string(), name: ft_name.unwrap_or(ft.to_string()) },
+                        rank: schema.rank(),
+                        default_value: serde_json::to_value(&schema.default_value()).unwrap_or(serde_json::Value::Null),
+                    };
+                    WsResponse::success(serde_json::json!({
+                        "entity_type": entity_type,
+                        "field_type": field_type,
+                        "schema": field_schema_model
+                    }))
+                }
                 Err(e) => WsResponse::error(format!("Failed to get field schema: {:?}", e)),
             }
         }
@@ -703,7 +771,7 @@ fn json_to_qlib_value(json: &serde_json::Value) -> Result<qlib_rs::Value, String
     }
 }
 
-async fn config_to_notify_config(config: &NotifyConfigJson, handle: &StoreHandle) -> Result<qlib_rs::NotifyConfig, String> {
+async fn config_to_notify_config(config: &crate::models::NotifyConfigModel, handle: &StoreHandle) -> Result<qlib_rs::NotifyConfig, String> {
     let field_type = resolve_field_identifier(handle, &config.field).await?;
 
     let mut context = Vec::new();
