@@ -10,6 +10,18 @@ use crate::models::{
     LogoutRequest,
 };
 use crate::AppState;
+use crate::store_service::StoreHandle;
+
+/// Helper function to resolve a field identifier (either name or numeric ID)
+async fn resolve_field_identifier(handle: &StoreHandle, field_identifier: &str) -> Result<FieldType, String> {
+    // Try to parse as a numeric field type ID first, otherwise look up by name
+    if let Ok(field_type_id) = field_identifier.parse::<u64>() {
+        Ok(FieldType(field_type_id))
+    } else {
+        handle.get_field_type(field_identifier).await
+            .map_err(|e| format!("Failed to get field type for '{}': {:?}", field_identifier, e))
+    }
+}
 
 pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> impl Responder {
     let handle = &state.store_handle;
@@ -268,24 +280,29 @@ pub async fn read(req: HttpRequest, state: web::Data<AppState>, body: web::Json<
 
     let mut field_types = Vec::new();
     for field_name in &body.fields {
-        match handle.get_field_type(field_name).await {
-            Ok(ft) => {
-                let scope = match handle.get_scope(subject_id, entity_id, ft).await {
-                    Ok(s) => s,
-                    Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Authorization check failed: {:?}", e))),
-                };
-                if scope == AuthorizationScope::None {
-                    return HttpResponse::Forbidden().json(ApiResponse::<()>::error("Access denied".to_string()));
+        // Try to parse as a numeric field type ID first, otherwise look up by name
+        let ft = if let Ok(field_type_id) = field_name.parse::<u64>() {
+            FieldType(field_type_id)
+        } else {
+            match handle.get_field_type(field_name).await {
+                Ok(ft) => ft,
+                Err(e) => {
+                    return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
+                        "Failed to get field type for '{}': {:?}",
+                        field_name, e
+                    )));
                 }
-                field_types.push(ft);
             }
-            Err(e) => {
-                return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
-                    "Failed to get field type for '{}': {:?}",
-                    field_name, e
-                )));
-            }
+        };
+        
+        let scope = match handle.get_scope(subject_id, entity_id, ft).await {
+            Ok(s) => s,
+            Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Authorization check failed: {:?}", e))),
+        };
+        if scope == AuthorizationScope::None {
+            return HttpResponse::Forbidden().json(ApiResponse::<()>::error("Access denied".to_string()));
         }
+        field_types.push(ft);
     }
 
     match handle.read(entity_id, &field_types).await {
@@ -319,13 +336,18 @@ pub async fn write(req: HttpRequest, state: web::Data<AppState>, body: web::Json
         }
     };
 
-    let field_type = match handle.get_field_type(&body.field).await {
-        Ok(ft) => ft,
-        Err(e) => {
-            return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
-                "Failed to get field type: {:?}",
-                e
-            )));
+    // Try to parse as a numeric field type ID first, otherwise look up by name
+    let field_type = if let Ok(field_type_id) = body.field.parse::<u64>() {
+        FieldType(field_type_id)
+    } else {
+        match handle.get_field_type(&body.field).await {
+            Ok(ft) => ft,
+            Err(e) => {
+                return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
+                    "Failed to get field type: {:?}",
+                    e
+                )));
+            }
         }
     };
 
@@ -692,13 +714,10 @@ pub async fn resolve_indirection(req: HttpRequest, state: web::Data<AppState>, b
 
     let mut field_types = Vec::new();
     for field_name in &body.fields {
-        match handle.get_field_type(field_name).await {
+        match resolve_field_identifier(handle, field_name).await {
             Ok(ft) => field_types.push(ft),
             Err(e) => {
-                return HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!(
-                    "Failed to get field type for '{}': {:?}",
-                    field_name, e
-                )));
+                return HttpResponse::BadRequest().json(ApiResponse::<()>::error(e));
             }
         }
     }

@@ -10,7 +10,18 @@ use crossbeam::channel;
 use crate::store_service::StoreHandle;
 use crate::AppState;
 
-use qlib_rs::{auth::AuthorizationScope, EntityId};
+use qlib_rs::{auth::AuthorizationScope, EntityId, FieldType};
+
+/// Helper function to resolve a field identifier (either name or numeric ID)
+async fn resolve_field_identifier(handle: &StoreHandle, field_identifier: &str) -> Result<FieldType, String> {
+    // Try to parse as a numeric field type ID first, otherwise look up by name
+    if let Ok(field_type_id) = field_identifier.parse::<u64>() {
+        Ok(FieldType(field_type_id))
+    } else {
+        handle.get_field_type(field_identifier).await
+            .map_err(|e| format!("Failed to get field type for '{}': {:?}", field_identifier, e))
+    }
+}
 
 /// Check session ownership for websocket connections
 async fn check_websocket_session_ownership(
@@ -316,13 +327,10 @@ async fn handle_ws_request(
 
             let mut field_types = Vec::new();
             for field_name in &fields {
-                match handle.get_field_type(field_name).await {
+                match resolve_field_identifier(handle, field_name).await {
                     Ok(ft) => field_types.push(ft),
                     Err(e) => {
-                        return WsResponse::error(format!(
-                            "Failed to get field type '{}': {:?}",
-                            field_name, e
-                        ))
+                        return WsResponse::error(e)
                     }
                 }
             }
@@ -359,9 +367,9 @@ async fn handle_ws_request(
                 Err(e) => return WsResponse::error(format!("Invalid entity ID: {}", e)),
             };
 
-            let field_type = match handle.get_field_type(&field).await {
+            let field_type = match resolve_field_identifier(handle, &field).await {
                 Ok(ft) => ft,
-                Err(e) => return WsResponse::error(format!("Failed to get field type: {:?}", e)),
+                Err(e) => return WsResponse::error(e),
             };
 
             let scope = match handle.get_scope(subject_id, entity_id, field_type).await {
@@ -635,9 +643,9 @@ async fn handle_ws_request(
 
             let mut field_types = Vec::new();
             for field_name in &fields {
-                match handle.get_field_type(field_name).await {
+                match resolve_field_identifier(handle, field_name).await {
                     Ok(ft) => field_types.push(ft),
-                    Err(e) => return WsResponse::error(format!("Failed to get field type '{}': {:?}", field_name, e)),
+                    Err(e) => return WsResponse::error(e),
                 }
             }
 
@@ -696,15 +704,13 @@ fn json_to_qlib_value(json: &serde_json::Value) -> Result<qlib_rs::Value, String
 }
 
 async fn config_to_notify_config(config: &NotifyConfigJson, handle: &StoreHandle) -> Result<qlib_rs::NotifyConfig, String> {
-    let field_type = handle.get_field_type(&config.field).await
-        .map_err(|e| format!("Failed to get field type: {:?}", e))?;
+    let field_type = resolve_field_identifier(handle, &config.field).await?;
 
     let mut context = Vec::new();
     for path in &config.context {
         let mut path_types = Vec::new();
         for field_name in path {
-            let ft = handle.get_field_type(field_name).await
-                .map_err(|e| format!("Failed to get context field type: {:?}", e))?;
+            let ft = resolve_field_identifier(handle, field_name).await?;
             path_types.push(ft);
         }
         context.push(path_types);
