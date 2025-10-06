@@ -833,15 +833,23 @@ pub async fn get_subject_and_session_from_request(
     jwt_secret: &str,
     handle: &crate::store_service::StoreHandle,
 ) -> Result<(EntityId, EntityId), String> {
-    let auth_header = req.headers().get("Authorization").ok_or("No Authorization header")?;
-
-    let auth_str = auth_header.to_str().map_err(|_| "Invalid header")?;
-
-    if !auth_str.starts_with("Bearer ") {
-        return Err("Invalid token format".into());
-    }
-
-    let token = &auth_str[7..];
+    // First try to get token from Authorization header
+    let token = if let Some(auth_header) = req.headers().get("Authorization") {
+        let auth_str = auth_header.to_str().map_err(|_| "Invalid header")?;
+        if !auth_str.starts_with("Bearer ") {
+            return Err("Invalid token format".into());
+        }
+        auth_str[7..].to_string()
+    } else {
+        // For WebSocket connections, try to get token from query parameter
+        req.uri().query()
+            .and_then(|query| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .find(|(key, _)| key == "token")
+                    .map(|(_, value)| value.to_string())
+            })
+            .ok_or("No Authorization header or token query parameter")?
+    };
 
     use jsonwebtoken::{decode, Validation, DecodingKey};
 
