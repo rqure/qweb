@@ -426,7 +426,8 @@ async fn handle_ws_request(
                     map.insert(config_hash, config);
                     WsResponse::success(serde_json::json!({
                         "message": "Notification registered",
-                        "config_hash": config_hash
+                        // Send as string to avoid JavaScript number precision loss (53-bit vs 64-bit)
+                        "config_hash": config_hash.to_string()
                     }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to register notification: {:?}", e)),
