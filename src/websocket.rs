@@ -425,7 +425,8 @@ async fn handle_ws_request(
                     let mut map = registered_configs.write().await;
                     map.insert(config_hash, config);
                     WsResponse::success(serde_json::json!({
-                        "message": "Notification registered"
+                        "message": "Notification registered",
+                        "config_hash": config_hash
                     }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to register notification: {:?}", e)),
