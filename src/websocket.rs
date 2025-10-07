@@ -125,9 +125,19 @@ pub async fn ws_handler(
         let mut session_clone = session.clone();
         tokio::spawn(async move {
             while let Some(notification) = tokio_receiver.recv().await {
+                // Serialize notification and convert config_hash to string for JavaScript
+                let mut notification_value = serde_json::to_value(&notification).unwrap();
+                if let Some(obj) = notification_value.as_object_mut() {
+                    if let Some(config_hash) = obj.get("config_hash") {
+                        if let Some(hash_num) = config_hash.as_u64() {
+                            obj.insert("config_hash".to_string(), serde_json::Value::String(hash_num.to_string()));
+                        }
+                    }
+                }
+                
                 let notification_json = serde_json::to_string(&WsResponse::success(serde_json::json!({
                     "type": "notification",
-                    "notification": notification
+                    "notification": notification_value
                 }))).unwrap();
                 if let Err(e) = session_clone.text(notification_json).await {
                     error!("Failed to send notification: {}", e);
