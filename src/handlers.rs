@@ -4,7 +4,7 @@ use qlib_rs::auth::AuthorizationScope;
 
 use crate::models::{
     ApiResponse, CreateRequest, DeleteRequest, FindRequest, ReadRequest,
-    SchemaRequest, CompleteSchemaRequest, WriteRequest, LoginRequest, LoginResponse,
+    SchemaRequest, CompleteSchemaRequest, UpdateSchemaRequest, WriteRequest, LoginRequest, LoginResponse,
     GetEntityTypeRequest, GetFieldTypeRequest, ResolveEntityTypeRequest, ResolveFieldTypeRequest, GetFieldSchemaRequest,
     EntityExistsRequest, FieldExistsRequest, ResolveIndirectionRequest, RefreshRequest,
     LogoutRequest,
@@ -481,6 +481,23 @@ pub async fn complete_schema(req: HttpRequest, state: web::Data<AppState>, body:
         }
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to get complete schema: {:?}", e))),
+    }
+}
+
+pub async fn update_schema(req: HttpRequest, state: web::Data<AppState>, body: web::Json<UpdateSchemaRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
+    };
+
+    match handle.update_schema(body.entity_type, body.inherit.clone(), body.fields.clone()).await {
+        Ok(_) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+            "message": "Schema updated successfully"
+        }))),
+        Err(e) => HttpResponse::InternalServerError()
+            .json(ApiResponse::<()>::error(format!("Failed to update schema: {:?}", e))),
     }
 }
 

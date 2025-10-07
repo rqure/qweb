@@ -66,6 +66,13 @@ pub struct CompleteSchemaRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateSchemaRequest {
+    pub entity_type: EntityType,
+    pub inherit: Vec<EntityType>,
+    pub fields: std::collections::HashMap<FieldType, qlib_rs::FieldSchema>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GetEntityTypeRequest {
     pub name: String,
 }

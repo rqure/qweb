@@ -46,6 +46,7 @@ enum WsRequest {
     UnregisterNotification { config: NotifyConfig },
     Schema { entity_type: EntityType },
     CompleteSchema { entity_type: EntityType },
+    UpdateSchema { entity_type: EntityType, inherit: Vec<EntityType>, fields: std::collections::HashMap<FieldType, qlib_rs::FieldSchema> },
     GetEntityType { name: String },
     GetFieldType { name: String },
     ResolveEntityType { entity_type: EntityType },
@@ -472,6 +473,19 @@ async fn handle_ws_request(
                     }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to get complete schema: {:?}", e)),
+            }
+        }
+        WsRequest::UpdateSchema { entity_type, inherit, fields } => {
+            let _subject_id = match subject_id {
+                Some(id) => id,
+                None => return WsResponse::error("Authentication required".to_string()),
+            };
+
+            match handle.update_schema(entity_type, inherit, fields).await {
+                Ok(_) => WsResponse::success(serde_json::json!({
+                    "message": "Schema updated successfully"
+                })),
+                Err(e) => WsResponse::error(format!("Failed to update schema: {:?}", e)),
             }
         }
         WsRequest::GetEntityType { name } => {

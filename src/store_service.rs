@@ -37,6 +37,12 @@ pub enum StoreCommand {
         field_type: FieldType,
         respond_to: oneshot::Sender<Result<FieldSchema>>,
     },
+    UpdateSchema {
+        entity_type: EntityType,
+        inherit: Vec<EntityType>,
+        fields: std::collections::HashMap<FieldType, FieldSchema>,
+        respond_to: oneshot::Sender<Result<()>>,
+    },
     EntityExists {
         entity_id: EntityId,
         respond_to: oneshot::Sender<bool>,
@@ -210,7 +216,26 @@ impl StoreHandle {
             })
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
         rx.await
-            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?
+    }
+
+    pub async fn update_schema(
+        &self,
+        entity_type: EntityType,
+        inherit: Vec<EntityType>,
+        fields: std::collections::HashMap<FieldType, FieldSchema>,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(StoreCommand::UpdateSchema {
+                entity_type,
+                inherit,
+                fields,
+                respond_to: tx,
+            })
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?
     }
 
     pub async fn entity_exists(&self, entity_id: EntityId) -> bool {
@@ -605,6 +630,48 @@ impl StoreService {
                 respond_to,
             } => {
                 let result = self.proxy.get_field_schema(entity_type, field_type);
+                self.send_result(result, respond_to);
+            }
+            StoreCommand::UpdateSchema { entity_type, inherit, fields, respond_to } => {
+                // Convert to String-based schema for StoreProxy API
+                let entity_type_name = match self.proxy.resolve_entity_type(entity_type) {
+                    Ok(name) => name,
+                    Err(e) => {
+                        self.send_result(Err(e), respond_to);
+                        return;
+                    }
+                };
+
+                let mut inherit_names = Vec::new();
+                for et in inherit {
+                    match self.proxy.resolve_entity_type(et) {
+                        Ok(name) => inherit_names.push(name),
+                        Err(e) => {
+                            self.send_result(Err(e), respond_to);
+                            return;
+                        }
+                    }
+                }
+
+                // Build schema with String types
+                let mut schema = qlib_rs::EntitySchema::<qlib_rs::Single, String, String>::new(entity_type_name, inherit_names);
+                
+                // Convert fields to String-keyed fields by converting each FieldSchema
+                for (field_type, field_schema) in fields {
+                    let field_name = match self.proxy.resolve_field_type(field_type) {
+                        Ok(name) => name,
+                        Err(e) => {
+                            self.send_result(Err(e), respond_to);
+                            return;
+                        }
+                    };
+                    
+                    // Convert FieldSchema<FieldType> to FieldSchema<String>
+                    let string_field_schema = field_schema.to_string_schema(&self.proxy);
+                    schema.fields.insert(field_name, string_field_schema);
+                }
+
+                let result = self.proxy.update_schema(schema);
                 self.send_result(result, respond_to);
             }
             StoreCommand::EntityExists {
