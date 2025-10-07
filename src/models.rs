@@ -19,6 +19,7 @@ pub struct WriteRequest {
 pub struct CreateRequest {
     pub entity_type: EntityType,
     pub name: String,
+    pub parent_id: Option<EntityId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

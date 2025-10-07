@@ -39,7 +39,7 @@ async fn check_websocket_session_ownership(
 enum WsRequest {
     Read { entity_id: EntityId, fields: Vec<FieldType> },
     Write { entity_id: EntityId, field: FieldType, value: Value },
-    Create { entity_type: EntityType, name: String },
+    Create { entity_type: EntityType, name: String, parent_id: Option<EntityId> },
     Delete { entity_id: EntityId },
     Find { entity_type: EntityType, filter: Option<String> },
     RegisterNotification { config: NotifyConfig },
@@ -347,7 +347,7 @@ async fn handle_ws_request(
             }
         }
 
-        WsRequest::Create { entity_type, name } => {
+        WsRequest::Create { entity_type, name, parent_id } => {
             let subject_id = match subject_id {
                 Some(id) => id,
                 None => return WsResponse::error("Authentication required".to_string()),
@@ -362,7 +362,7 @@ async fn handle_ws_request(
                 return WsResponse::error("Access denied".to_string());
             }
 
-            match handle.create_entity(entity_type, None, &name).await {
+            match handle.create_entity(entity_type, parent_id, &name).await {
                 Ok(entity_id) => WsResponse::success(serde_json::json!({
                     "entity_id": entity_id,
                     "name": name

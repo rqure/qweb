@@ -368,7 +368,7 @@ pub async fn create(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
         return HttpResponse::Forbidden().json(ApiResponse::<()>::error("Access denied".to_string()));
     }
 
-    match handle.create_entity(entity_type, None, &body.name).await {
+    match handle.create_entity(entity_type, body.parent_id, &body.name).await {
         Ok(entity_id) => {
             HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
                 "entity_id": entity_id,
