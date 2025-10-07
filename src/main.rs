@@ -157,6 +157,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/find", web::post().to(handlers::find))
             .route("/api/schema", web::post().to(handlers::schema))
             .route("/api/complete_schema", web::post().to(handlers::complete_schema))
+            .route("/api/get_entity_type", web::post().to(handlers::get_entity_type))
+            .route("/api/get_field_type", web::post().to(handlers::get_field_type))
             .route("/api/resolve_entity_type", web::post().to(handlers::resolve_entity_type))
             .route("/api/resolve_field_type", web::post().to(handlers::resolve_field_type))
             .route("/api/get_field_schema", web::post().to(handlers::get_field_schema))

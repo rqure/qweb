@@ -46,6 +46,8 @@ enum WsRequest {
     UnregisterNotification { config: NotifyConfig },
     Schema { entity_type: EntityType },
     CompleteSchema { entity_type: EntityType },
+    GetEntityType { name: String },
+    GetFieldType { name: String },
     ResolveEntityType { entity_type: EntityType },
     ResolveFieldType { field_type: FieldType },
     GetFieldSchema { entity_type: EntityType, field_type: FieldType },
@@ -470,6 +472,22 @@ async fn handle_ws_request(
                     }))
                 }
                 Err(e) => WsResponse::error(format!("Failed to get complete schema: {:?}", e)),
+            }
+        }
+        WsRequest::GetEntityType { name } => {
+            match handle.get_entity_type(&name).await {
+                Ok(entity_type) => WsResponse::success(serde_json::json!({
+                    "entity_type": entity_type
+                })),
+                Err(e) => WsResponse::error(format!("Failed to get entity type: {:?}", e)),
+            }
+        }
+        WsRequest::GetFieldType { name } => {
+            match handle.get_field_type(&name).await {
+                Ok(field_type) => WsResponse::success(serde_json::json!({
+                    "field_type": field_type
+                })),
+                Err(e) => WsResponse::error(format!("Failed to get field type: {:?}", e)),
             }
         }
         WsRequest::ResolveEntityType { entity_type } => {

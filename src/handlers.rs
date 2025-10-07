@@ -5,7 +5,7 @@ use qlib_rs::auth::AuthorizationScope;
 use crate::models::{
     ApiResponse, CreateRequest, DeleteRequest, FindRequest, ReadRequest,
     SchemaRequest, CompleteSchemaRequest, WriteRequest, LoginRequest, LoginResponse,
-    ResolveEntityTypeRequest, ResolveFieldTypeRequest, GetFieldSchemaRequest,
+    GetEntityTypeRequest, GetFieldTypeRequest, ResolveEntityTypeRequest, ResolveFieldTypeRequest, GetFieldSchemaRequest,
     EntityExistsRequest, FieldExistsRequest, ResolveIndirectionRequest, RefreshRequest,
     LogoutRequest,
 };
@@ -484,6 +484,22 @@ pub async fn complete_schema(req: HttpRequest, state: web::Data<AppState>, body:
     }
 }
 
+pub async fn get_entity_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<GetEntityTypeRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _user_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(uid) => uid,
+        Err(_) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error("Unauthorized".to_string())),
+    };
+
+    match handle.get_entity_type(&body.name).await {
+        Ok(entity_type) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+            "entity_type": entity_type
+        }))),
+        Err(e) => HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!("{:?}", e))),
+    }
+}
+
 pub async fn resolve_entity_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ResolveEntityTypeRequest>) -> impl Responder {
     let handle = &state.store_handle;
 
@@ -500,6 +516,22 @@ pub async fn resolve_entity_type(req: HttpRequest, state: web::Data<AppState>, b
         }))),
         Err(e) => HttpResponse::InternalServerError()
             .json(ApiResponse::<()>::error(format!("Failed to resolve entity type: {:?}", e))),
+    }
+}
+
+pub async fn get_field_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<GetFieldTypeRequest>) -> impl Responder {
+    let handle = &state.store_handle;
+
+    let _user_id = match get_subject_from_request(&req, &state.jwt_secret) {
+        Ok(uid) => uid,
+        Err(_) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error("Unauthorized".to_string())),
+    };
+
+    match handle.get_field_type(&body.name).await {
+        Ok(field_type) => HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
+            "field_type": field_type
+        }))),
+        Err(e) => HttpResponse::BadRequest().json(ApiResponse::<()>::error(format!("{:?}", e))),
     }
 }
 

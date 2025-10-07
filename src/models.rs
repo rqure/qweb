@@ -66,6 +66,16 @@ pub struct CompleteSchemaRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct GetEntityTypeRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetFieldTypeRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ResolveEntityTypeRequest {
     pub entity_type: EntityType,
 }
