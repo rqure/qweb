@@ -35,6 +35,13 @@ async fn check_websocket_session_ownership(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct WsRequestWrapper {
+    request_id: Option<String>,
+    #[serde(flatten)]
+    request: WsRequest,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum WsRequest {
     Read { entity_id: EntityId, fields: Vec<FieldType> },
@@ -63,22 +70,25 @@ enum WsRequest {
 #[derive(Debug, Serialize)]
 struct WsResponse {
     success: bool,
+    request_id: Option<String>,
     data: Option<serde_json::Value>,
     error: Option<String>,
 }
 
 impl WsResponse {
-    fn success(data: serde_json::Value) -> Self {
+    fn success(request_id: Option<String>, data: serde_json::Value) -> Self {
         WsResponse {
             success: true,
+            request_id,
             data: Some(data),
             error: None,
         }
     }
 
-    fn error(error: String) -> Self {
+    fn error(request_id: Option<String>, error: String) -> Self {
         WsResponse {
             success: false,
+            request_id,
             data: None,
             error: Some(error),
         }
@@ -135,7 +145,8 @@ pub async fn ws_handler(
                     }
                 }
                 
-                let notification_json = serde_json::to_string(&WsResponse::success(serde_json::json!({
+                // Notifications don't have request_id
+                let notification_json = serde_json::to_string(&WsResponse::success(None, serde_json::json!({
                     "type": "notification",
                     "notification": notification_value
                 }))).unwrap();
@@ -168,11 +179,11 @@ pub async fn ws_handler(
         while let Some(Ok(msg)) = msg_stream.next().await {
             match msg {
                 Message::Text(text) => {
-                    let response = match serde_json::from_str::<WsRequest>(&text) {
-                        Ok(request) => {
-                            handle_ws_request(request, &handle, &crossbeam_sender, &registered_configs, subject_id, ws_session_id).await
+                    let response = match serde_json::from_str::<WsRequestWrapper>(&text) {
+                        Ok(wrapper) => {
+                            handle_ws_request(wrapper.request, wrapper.request_id, &handle, &crossbeam_sender, &registered_configs, subject_id, ws_session_id).await
                         }
-                        Err(e) => WsResponse::error(format!("Invalid JSON: {}", e)),
+                        Err(e) => WsResponse::error(None, format!("Invalid JSON: {}", e)),
                     };
 
                     let response_json = serde_json::to_string(&response).unwrap();
@@ -234,6 +245,7 @@ pub async fn ws_handler(
 
 async fn handle_ws_request(
     request: WsRequest,
+    request_id: Option<String>,
     handle: &StoreHandle,
     notification_sender: &channel::Sender<qlib_rs::Notification>,
     registered_configs: &Arc<RwLock<HashMap<u64, qlib_rs::NotifyConfig>>>,
@@ -241,18 +253,18 @@ async fn handle_ws_request(
     session_id: Option<qlib_rs::EntityId>,
 ) -> WsResponse {
     match request {
-        WsRequest::Ping => WsResponse::success(serde_json::json!({ "message": "pong" })),
+        WsRequest::Ping => WsResponse::success(request_id, serde_json::json!({ "message": "pong" })),
         
         WsRequest::Refresh => {
             // Extract and validate the existing subject_id and session_id
             let user_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Not authenticated".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Not authenticated".to_string()),
             };
 
             let session_id = match session_id {
                 Some(id) => id,
-                None => return WsResponse::error("No session".to_string()),
+                None => return WsResponse::error(request_id.clone(), "No session".to_string()),
             };
 
             // Issue a new token with extended expiration
@@ -270,30 +282,30 @@ async fn handle_ws_request(
             
             let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(jwt_secret.as_bytes())) {
                 Ok(t) => t,
-                Err(e) => return WsResponse::error(format!("Failed to generate token: {:?}", e)),
+                Err(e) => return WsResponse::error(request_id.clone(), format!("Failed to generate token: {:?}", e)),
             };
 
             // Update Session with new token and expiration
             let token_field_type = match handle.get_field_type("Token").await {
                 Ok(ft) => ft,
-                Err(e) => return WsResponse::error(format!("Failed to get Token field type: {:?}", e)),
+                Err(e) => return WsResponse::error(request_id.clone(), format!("Failed to get Token field type: {:?}", e)),
             };
 
             let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
                 Ok(ft) => ft,
-                Err(e) => return WsResponse::error(format!("Failed to get ExpiresAt field type: {:?}", e)),
+                Err(e) => return WsResponse::error(request_id.clone(), format!("Failed to get ExpiresAt field type: {:?}", e)),
             };
 
             if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), None, None, None, None).await {
-                return WsResponse::error(format!("Failed to update token: {:?}", e));
+                return WsResponse::error(request_id.clone(), format!("Failed to update token: {:?}", e));
             }
 
             let expiration_timestamp = qlib_rs::millis_to_timestamp(expiration.timestamp_millis() as u64);
             if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), None, None, None, None).await {
-                return WsResponse::error(format!("Failed to update expiration: {:?}", e));
+                return WsResponse::error(request_id.clone(), format!("Failed to update expiration: {:?}", e));
             }
 
-            WsResponse::success(serde_json::json!({
+            WsResponse::success(request_id.clone(), serde_json::json!({
                 "token": token
             }))
         }
@@ -301,132 +313,132 @@ async fn handle_ws_request(
         WsRequest::Pipeline { commands } => {
             match handle.execute_pipeline(commands).await {
                 Ok(results) => {
-                    WsResponse::success(serde_json::json!({
+                    WsResponse::success(request_id.clone(), serde_json::json!({
                         "results": results
                     }))
                 }
-                Err(e) => WsResponse::error(format!("{:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("{:?}", e)),
             }
         }
         
         WsRequest::Read { entity_id, fields } => {
             let subject_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Authentication required".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
             };
 
             for &ft in &fields {
                 let scope = match handle.get_scope(subject_id, entity_id, ft).await {
                     Ok(s) => s,
-                    Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
+                    Err(e) => return WsResponse::error(request_id.clone(), format!("Authorization check failed: {:?}", e)),
                 };
                 if scope == AuthorizationScope::None {
-                    return WsResponse::error("Access denied".to_string());
+                    return WsResponse::error(request_id.clone(), "Access denied".to_string());
                 }
             }
 
             match handle.read(entity_id, &fields).await {
-                Ok((value, timestamp, writer_id)) => WsResponse::success(serde_json::json!({
+                Ok((value, timestamp, writer_id)) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "value": value,
                     "timestamp": timestamp,
                     "writer_id": writer_id
                 })),
-                Err(e) => WsResponse::error(format!("Failed to read entity: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to read entity: {:?}", e)),
             }
         }
 
         WsRequest::Write { entity_id, field, value } => {
             let subject_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Authentication required".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
             };
 
             let scope = match handle.get_scope(subject_id, entity_id, field).await {
                 Ok(s) => s,
-                Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
+                Err(e) => return WsResponse::error(request_id.clone(), format!("Authorization check failed: {:?}", e)),
             };
             if scope != AuthorizationScope::ReadWrite {
-                return WsResponse::error("Access denied".to_string());
+                return WsResponse::error(request_id.clone(), "Access denied".to_string());
             }
 
             match handle.write(entity_id, &[field], value, None, None, None, None).await {
-                Ok(_) => WsResponse::success(serde_json::json!({
+                Ok(_) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "message": "Successfully wrote value"
                 })),
-                Err(e) => WsResponse::error(format!("Failed to write: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to write: {:?}", e)),
             }
         }
 
         WsRequest::Create { entity_type, name, parent_id } => {
             let subject_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Authentication required".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
             };
 
             let scope = match handle.get_scope(subject_id, qlib_rs::EntityId::new(entity_type, 0), qlib_rs::FieldType(0)).await {
                 Ok(s) => s,
-                Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
+                Err(e) => return WsResponse::error(request_id.clone(), format!("Authorization check failed: {:?}", e)),
             };
 
             if scope != qlib_rs::auth::AuthorizationScope::ReadWrite {
-                return WsResponse::error("Access denied".to_string());
+                return WsResponse::error(request_id.clone(), "Access denied".to_string());
             }
 
             match handle.create_entity(entity_type, parent_id, &name).await {
-                Ok(entity_id) => WsResponse::success(serde_json::json!({
+                Ok(entity_id) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "entity_id": entity_id,
                     "name": name
                 })),
-                Err(e) => WsResponse::error(format!("Failed to create entity: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to create entity: {:?}", e)),
             }
         }
 
         WsRequest::Delete { entity_id } => {
             let subject_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Authentication required".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
             };
 
             let scope = match handle.get_scope(subject_id, entity_id, qlib_rs::FieldType(0)).await {
                 Ok(s) => s,
-                Err(e) => return WsResponse::error(format!("Authorization check failed: {:?}", e)),
+                Err(e) => return WsResponse::error(request_id.clone(), format!("Authorization check failed: {:?}", e)),
             };
 
             if scope != qlib_rs::auth::AuthorizationScope::ReadWrite {
-                return WsResponse::error("Access denied".to_string());
+                return WsResponse::error(request_id.clone(), "Access denied".to_string());
             }
 
             match handle.delete_entity(entity_id).await {
-                Ok(_) => WsResponse::success(serde_json::json!({
+                Ok(_) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "message": "Successfully deleted entity"
                 })),
-                Err(e) => WsResponse::error(format!("Failed to delete entity: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to delete entity: {:?}", e)),
             }
         }
 
         WsRequest::Find { entity_type, filter } => {
             let _subject_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Authentication required".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
             };
 
             match handle.find_entities(entity_type, filter.as_deref()).await {
-                Ok(entity_ids) => WsResponse::success(serde_json::json!({
+                Ok(entity_ids) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "entities": entity_ids
                 })),
-                Err(e) => WsResponse::error(format!("Failed to find entities: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to find entities: {:?}", e)),
             }
         }
         WsRequest::RegisterNotification { config } => {
             let _subject_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Authentication required".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
             };
             let config_hash = qlib_rs::hash_notify_config(&config);
             {
                 let map = registered_configs.read().await;
                 if map.contains_key(&config_hash) {
-                    return WsResponse::error("Notification already registered".to_string());
+                    return WsResponse::error(request_id.clone(), "Notification already registered".to_string());
                 }
             }
 
@@ -434,25 +446,25 @@ async fn handle_ws_request(
                 Ok(_) => {
                     let mut map = registered_configs.write().await;
                     map.insert(config_hash, config);
-                    WsResponse::success(serde_json::json!({
+                    WsResponse::success(request_id.clone(), serde_json::json!({
                         "message": "Notification registered",
                         // Send as string to avoid JavaScript number precision loss (53-bit vs 64-bit)
                         "config_hash": config_hash.to_string()
                     }))
                 }
-                Err(e) => WsResponse::error(format!("Failed to register notification: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to register notification: {:?}", e)),
             }
         }
         WsRequest::UnregisterNotification { config } => {
             let _subject_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Authentication required".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
             };
             let config_hash = qlib_rs::hash_notify_config(&config);
             {
                 let map = registered_configs.read().await;
                 if !map.contains_key(&config_hash) {
-                    return WsResponse::error("Notification not registered".to_string());
+                    return WsResponse::error(request_id.clone(), "Notification not registered".to_string());
                 }
             }
 
@@ -460,107 +472,107 @@ async fn handle_ws_request(
                 Ok(_) => {
                     let mut map = registered_configs.write().await;
                     map.remove(&config_hash);
-                    WsResponse::success(serde_json::json!({
+                    WsResponse::success(request_id.clone(), serde_json::json!({
                         "message": "Notification unregistered"
                     }))
                 }
-                Err(e) => WsResponse::error(format!("Failed to unregister notification: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to unregister notification: {:?}", e)),
             }
         }
         WsRequest::Schema { entity_type } => {
             match handle.get_entity_schema(entity_type).await {
                 Ok(schema) => {
-                    WsResponse::success(serde_json::json!({
+                    WsResponse::success(request_id.clone(), serde_json::json!({
                         "schema": schema
                     }))
                 }
-                Err(e) => WsResponse::error(format!("Failed to get schema: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to get schema: {:?}", e)),
             }
         }
         WsRequest::CompleteSchema { entity_type } => {
             match handle.get_complete_entity_schema(entity_type).await {
                 Ok(schema) => {
-                    WsResponse::success(serde_json::json!({
+                    WsResponse::success(request_id.clone(), serde_json::json!({
                         "schema": schema
                     }))
                 }
-                Err(e) => WsResponse::error(format!("Failed to get complete schema: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to get complete schema: {:?}", e)),
             }
         }
         WsRequest::UpdateSchema { entity_type, inherit, fields } => {
             let _subject_id = match subject_id {
                 Some(id) => id,
-                None => return WsResponse::error("Authentication required".to_string()),
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
             };
 
             match handle.update_schema(entity_type, inherit, fields).await {
-                Ok(_) => WsResponse::success(serde_json::json!({
+                Ok(_) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "message": "Schema updated successfully"
                 })),
-                Err(e) => WsResponse::error(format!("Failed to update schema: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to update schema: {:?}", e)),
             }
         }
         WsRequest::GetEntityType { name } => {
             match handle.get_entity_type(&name).await {
-                Ok(entity_type) => WsResponse::success(serde_json::json!({
+                Ok(entity_type) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "entity_type": entity_type
                 })),
-                Err(e) => WsResponse::error(format!("Failed to get entity type: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to get entity type: {:?}", e)),
             }
         }
         WsRequest::GetFieldType { name } => {
             match handle.get_field_type(&name).await {
-                Ok(field_type) => WsResponse::success(serde_json::json!({
+                Ok(field_type) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "field_type": field_type
                 })),
-                Err(e) => WsResponse::error(format!("Failed to get field type: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to get field type: {:?}", e)),
             }
         }
         WsRequest::ResolveEntityType { entity_type } => {
             match handle.resolve_entity_type(entity_type).await {
-                Ok(name) => WsResponse::success(serde_json::json!({
+                Ok(name) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "name": name
                 })),
-                Err(e) => WsResponse::error(format!("Failed to resolve entity type: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to resolve entity type: {:?}", e)),
             }
         }
         WsRequest::ResolveFieldType { field_type } => {
             match handle.resolve_field_type(field_type).await {
-                Ok(name) => WsResponse::success(serde_json::json!({
+                Ok(name) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "name": name
                 })),
-                Err(e) => WsResponse::error(format!("Failed to resolve field type: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to resolve field type: {:?}", e)),
             }
         }
         WsRequest::GetFieldSchema { entity_type, field_type } => {
             match handle.get_field_schema(entity_type, field_type).await {
                 Ok(schema) => {
-                    WsResponse::success(serde_json::json!({
+                    WsResponse::success(request_id.clone(), serde_json::json!({
                         "schema": schema
                     }))
                 }
-                Err(e) => WsResponse::error(format!("Failed to get field schema: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to get field schema: {:?}", e)),
             }
         }
         WsRequest::EntityExists { entity_id } => {
             let exists = handle.entity_exists(entity_id).await;
-            WsResponse::success(serde_json::json!({
+            WsResponse::success(request_id.clone(), serde_json::json!({
                 "exists": exists
             }))
         }
         WsRequest::FieldExists { entity_type, field_type } => {
             let exists = handle.field_exists(entity_type, field_type).await;
-            WsResponse::success(serde_json::json!({
+            WsResponse::success(request_id.clone(), serde_json::json!({
                 "exists": exists
             }))
         }
         WsRequest::ResolveIndirection { entity_id, fields } => {
             match handle.resolve_indirection(entity_id, &fields).await {
-                Ok((resolved_entity_id, resolved_field_type)) => WsResponse::success(serde_json::json!({
+                Ok((resolved_entity_id, resolved_field_type)) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "resolved_entity_id": resolved_entity_id,
                     "resolved_field_type": resolved_field_type
                 })),
-                Err(e) => WsResponse::error(format!("Failed to resolve indirection: {:?}", e)),
+                Err(e) => WsResponse::error(request_id.clone(), format!("Failed to resolve indirection: {:?}", e)),
             }
         }
     }
