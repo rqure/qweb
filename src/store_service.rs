@@ -3,6 +3,7 @@ use qlib_rs::{
     PageResult, PushCondition, Result, Single, StoreProxy, Timestamp, Value,
     auth::AuthorizationScope, Notification, NotifyConfig,
 };
+use qlib_rs::app::ServiceState;
 use tokio::sync::{mpsc, oneshot};
 use crossbeam::channel::Sender;
 
@@ -117,9 +118,6 @@ pub enum StoreCommand {
     ExecutePipeline {
         commands: Vec<crate::models::PipelineCommand>,
         respond_to: oneshot::Sender<Result<Vec<crate::models::PipelineResult>>>,
-    },
-    MachineInfo {
-        respond_to: oneshot::Sender<Result<String>>,
     },
 }
 
@@ -461,17 +459,6 @@ impl StoreHandle {
         rx.await
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
     }
-
-    pub async fn machine_info(&self) -> Result<String> {
-        let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(StoreCommand::MachineInfo {
-                respond_to: tx,
-            })
-            .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
-        rx.await
-            .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
-    }
 }
 
 /// Create permission cache
@@ -541,6 +528,8 @@ pub struct StoreService {
     auth_config: qlib_rs::AuthConfig,
     permission_cache: Option<qlib_rs::Cache>,
     cel_executor: qlib_rs::CelExecutor,
+    // Optional ServiceState used to write periodic heartbeats for this service
+    service_state: Option<ServiceState>,
 }
 
 impl StoreService {
@@ -549,10 +538,45 @@ impl StoreService {
         let (sender, receiver) = mpsc::unbounded_channel();
         let handle = StoreHandle { sender };
         let auth_config = qlib_rs::AuthConfig::default();
+        // We need a mutable proxy reference to initialize ServiceState, so make proxy mutable here
+        let mut proxy = proxy;
         let permission_cache = create_permission_cache(&proxy);
         let cel_executor = qlib_rs::CelExecutor::new();
-        let service = StoreService { proxy, receiver, auth_config, permission_cache, cel_executor };
+
+        // Initialize ServiceState so qweb can write regular heartbeats. This uses the
+        // same StoreProxy connection owned by the StoreService.
+        let service_name = std::env::var("SERVICE_NAME").unwrap_or_else(|_| "qweb".to_string());
+        let heartbeat_interval_msecs: u64 = std::env::var("SERVICE_HEARTBEAT_INTERVAL_MSECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
+        // ServiceState::new() may call expect() internally and panic if the topology
+        // isn't present; protect against that so the whole process doesn't unwind.
+        let service_state = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            qlib_rs::app::ServiceState::new(&mut proxy, service_name.clone(), false, heartbeat_interval_msecs)
+        })) {
+            Ok(Ok(s)) => {
+                log::info!("ServiceState initialized (heartbeats enabled, fault_tolerant=false)");
+                Some(s)
+            }
+            Ok(Err(e)) => {
+                log::warn!("Failed to initialize ServiceState, service heartbeats disabled: {:?}", e);
+                None
+            }
+            Err(_) => {
+                log::warn!("Panic occurred while initializing ServiceState; service heartbeats disabled");
+                None
+            }
+        };
+
+        let service = StoreService { proxy, receiver, auth_config, permission_cache, cel_executor, service_state };
         (handle, service)
+    }
+
+    /// Return the EntityId for the initialized Service instance, if available.
+    pub fn get_service_id(&self) -> Option<EntityId> {
+        self.service_state.as_ref().map(|s| s.service_id)
     }
 
     fn send_result<T>(&self, result: Result<T>, respond_to: oneshot::Sender<Result<T>>)
@@ -580,6 +604,17 @@ impl StoreService {
                     std::process::exit(1);
                 }
                 log::warn!("Failed to process notifications: {:?}", e);
+            }
+            // Tick the ServiceState (handles heartbeat writes). If it reports connection lost,
+            // exit similarly to notification processing.
+            if let Some(ref mut svc) = self.service_state {
+                if let Err(e) = svc.tick(&mut self.proxy) {
+                    if let qlib_rs::Error::ConnectionLost = e {
+                        log::error!("Connection to store lost during ServiceState tick, exiting");
+                        std::process::exit(1);
+                    }
+                    log::warn!("ServiceState tick failed: {:?}", e);
+                }
             }
             // Sleep for 10ms
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -785,10 +820,6 @@ impl StoreService {
             }
             StoreCommand::ExecutePipeline { commands, respond_to } => {
                 let result = self.execute_pipeline_commands(commands);
-                self.send_result(result, respond_to);
-            }
-            StoreCommand::MachineInfo { respond_to } => {
-                let result = self.proxy.machine_info();
                 self.send_result(result, respond_to);
             }
         }

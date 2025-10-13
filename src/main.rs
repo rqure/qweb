@@ -17,33 +17,6 @@ pub struct AppState {
     qweb_service_id: EntityId,
 }
 
-async fn determine_qweb_service_id(handle: &StoreHandle) -> Result<EntityId, String> {
-    // Get machine name from machine_info
-    let machine_name = handle.machine_info().await
-        .map_err(|e| format!("Failed to get machine info: {:?}", e))?;
-    
-    info!("Machine name: {}", machine_name);
-    
-    // Get Service entity type
-    let service_entity_type = handle.get_entity_type("Service").await
-        .map_err(|e| format!("Failed to get Service entity type: {:?}", e))?;
-    
-    // Find qweb Service under the machine with the matching name using CEL filter
-    let filter = format!("Name == \"qweb\" && Parent->Name == \"{}\"", machine_name);
-    let services = handle.find_entities(service_entity_type, Some(&filter)).await
-        .map_err(|e| format!("Failed to find qweb Service: {:?}", e))?;
-    
-    if services.is_empty() {
-        return Err(format!("Could not find qweb service under machine '{}'", machine_name));
-    }
-    
-    if services.len() > 1 {
-        return Err(format!("Found multiple qweb services under machine '{}' - this should not happen", machine_name));
-    }
-    
-    Ok(services[0])
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
@@ -73,27 +46,25 @@ async fn main() -> std::io::Result<()> {
 
     info!("JWT secret configured");
 
-    // Create StoreService and get handle
+    // Create StoreService and get handle. StoreService will initialize a ServiceState
+    // using the same StoreProxy connection so qweb can write periodic heartbeats.
     let (store_handle, mut store_service) = StoreService::new(store_proxy);
+
+    // Try to obtain the Service entity id from the initialized ServiceState. This avoids
+    // performing an extra lookup here; if ServiceState initialization failed we'll fall
+    // back to the asynchronous handle-based discovery as before.
+    let qweb_service_id = if let Some(id) = store_service.get_service_id() {
+        info!("Determined qweb service ID from ServiceState: {:?}", id);
+        id
+    } else {
+        error!("Failed to determine qweb service ID from ServiceState");
+        std::process::exit(1);
+    };
 
     // Spawn the StoreService in a separate task
     tokio::spawn(async move {
         store_service.run().await;
     });
-
-    // Determine which qweb service instance we are
-    let qweb_service_id = match determine_qweb_service_id(&store_handle).await {
-        Ok(id) => {
-            info!("Determined qweb service ID: {:?}", id);
-            id
-        }
-        Err(e) => {
-            error!("Failed to determine qweb service ID: {:?}", e);
-            return Err(std::io::Error::other(
-                format!("Failed to determine qweb service ID: {:?}", e),
-            ));
-        }
-    };
 
     let app_state = web::Data::new(AppState { 
         store_handle: store_handle.clone(), 
