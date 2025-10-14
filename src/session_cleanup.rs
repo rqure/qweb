@@ -177,6 +177,7 @@ pub async fn session_cleanup_task(handle: StoreHandle, qweb_service_id: EntityId
                     previous_user_ft,
                     expires_at_ft,
                     token_ft,
+                    qweb_service_id,
                 ));
             }
         }
@@ -191,6 +192,7 @@ async fn cleanup_expired_session(
     previous_user_ft: qlib_rs::FieldType,
     expires_at_ft: qlib_rs::FieldType,
     token_ft: qlib_rs::FieldType,
+    writer: qlib_rs::EntityId,
 ) {
     // Read CurrentUser and ExpiresAt
     let (current_user, _, _) = match handle.read(session_id, &[current_user_ft]).await {
@@ -216,25 +218,25 @@ async fn cleanup_expired_session(
             info!("Cleaning up expired session: {:?}", session_id);
             
             // Save CurrentUser to PreviousUser
-            if let Value::EntityReference(Some(user_id)) = current_user {
-                if let Err(e) = handle.write(session_id, &[previous_user_ft], Value::EntityReference(Some(user_id)), None, None, None, None).await {
+                if let Value::EntityReference(Some(user_id)) = current_user {
+                if let Err(e) = handle.write(session_id, &[previous_user_ft], Value::EntityReference(Some(user_id)), Some(writer), None, None, None).await {
                     error!("Failed to save previous user during cleanup: {:?}", e);
                 }
             }
             
             // Clear CurrentUser
-            if let Err(e) = handle.write(session_id, &[current_user_ft], Value::EntityReference(None), None, None, None, None).await {
+            if let Err(e) = handle.write(session_id, &[current_user_ft], Value::EntityReference(None), Some(writer), None, None, None).await {
                 error!("Failed to clear current user during cleanup: {:?}", e);
                 return;
             }
             
             // Clear token
-            if let Err(e) = handle.write(session_id, &[token_ft], Value::String("".to_string()), None, None, None, None).await {
+            if let Err(e) = handle.write(session_id, &[token_ft], Value::String("".to_string()), Some(writer), None, None, None).await {
                 error!("Failed to clear token during cleanup: {:?}", e);
             }
             
             // Reset expiration
-            if let Err(e) = handle.write(session_id, &[expires_at_ft], Value::Timestamp(qlib_rs::epoch()), None, None, None, None).await {
+            if let Err(e) = handle.write(session_id, &[expires_at_ft], Value::Timestamp(qlib_rs::epoch()), Some(writer), None, None, None).await {
                 error!("Failed to reset expiration during cleanup: {:?}", e);
             }
         }

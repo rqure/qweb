@@ -103,6 +103,8 @@ pub async fn ws_handler(
     let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body)?;
 
     let handle = state.store_handle.clone();
+    // copy qweb service id so the spawned task can use it as a fallback writer id
+    let qweb_service_id = state.qweb_service_id;
     let (subject_id, ws_session_id) = match crate::handlers::get_subject_and_session_from_request(&req, &state.jwt_secret, &handle).await {
         Ok((uid, sid)) => {
             // Verify session ownership
@@ -226,14 +228,16 @@ pub async fn ws_handler(
                 handle.get_field_type("ExpiresAt").await,
             ) {
                 // Save CurrentUser to PreviousUser
+                // Use the authenticated subject as the writer if available, otherwise fall back to the qweb service id
+                let writer = subject_id.unwrap_or(qweb_service_id);
                 if let Ok((qlib_rs::Value::EntityReference(Some(user_id)), _, _)) = handle.read(ws_session_id, &[current_user_ft]).await {
-                    let _ = handle.write(ws_session_id, &[previous_user_ft], qlib_rs::Value::EntityReference(Some(user_id)), None, None, None, None).await;
+                    let _ = handle.write(ws_session_id, &[previous_user_ft], qlib_rs::Value::EntityReference(Some(user_id)), Some(writer), None, None, None).await;
                 }
                 
                 // Clear the session
-                let _ = handle.write(ws_session_id, &[current_user_ft], qlib_rs::Value::EntityReference(None), None, None, None, None).await;
-                let _ = handle.write(ws_session_id, &[token_ft], qlib_rs::Value::String("".to_string()), None, None, None, None).await;
-                let _ = handle.write(ws_session_id, &[expires_at_ft], qlib_rs::Value::Timestamp(qlib_rs::epoch()), None, None, None, None).await;
+                let _ = handle.write(ws_session_id, &[current_user_ft], qlib_rs::Value::EntityReference(None), Some(writer), None, None, None).await;
+                let _ = handle.write(ws_session_id, &[token_ft], qlib_rs::Value::String("".to_string()), Some(writer), None, None, None).await;
+                let _ = handle.write(ws_session_id, &[expires_at_ft], qlib_rs::Value::Timestamp(qlib_rs::epoch()), Some(writer), None, None, None).await;
             }
         }
 
@@ -296,12 +300,12 @@ async fn handle_ws_request(
                 Err(e) => return WsResponse::error(request_id.clone(), format!("Failed to get ExpiresAt field type: {:?}", e)),
             };
 
-            if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), None, None, None, None).await {
+            if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), Some(user_id), None, None, None).await {
                 return WsResponse::error(request_id.clone(), format!("Failed to update token: {:?}", e));
             }
 
             let expiration_timestamp = qlib_rs::millis_to_timestamp(expiration.timestamp_millis() as u64);
-            if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), None, None, None, None).await {
+            if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), Some(user_id), None, None, None).await {
                 return WsResponse::error(request_id.clone(), format!("Failed to update expiration: {:?}", e));
             }
 
@@ -311,7 +315,12 @@ async fn handle_ws_request(
         }
         
         WsRequest::Pipeline { commands } => {
-            match handle.execute_pipeline(commands).await {
+            let subject = match subject_id {
+                Some(id) => id,
+                None => return WsResponse::error(request_id.clone(), "Authentication required".to_string()),
+            };
+
+            match handle.execute_pipeline(commands, Some(subject)).await {
                 Ok(results) => {
                     WsResponse::success(request_id.clone(), serde_json::json!({
                         "results": results
@@ -361,7 +370,7 @@ async fn handle_ws_request(
                 return WsResponse::error(request_id.clone(), "Access denied".to_string());
             }
 
-            match handle.write(entity_id, &[field], value, None, None, None, None).await {
+            match handle.write(entity_id, &[field], value, Some(subject_id), None, None, None).await {
                 Ok(_) => WsResponse::success(request_id.clone(), serde_json::json!({
                     "message": "Successfully wrote value"
                 })),

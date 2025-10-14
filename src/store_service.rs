@@ -117,6 +117,9 @@ pub enum StoreCommand {
     },
     ExecutePipeline {
         commands: Vec<crate::models::PipelineCommand>,
+        /// The authenticated subject on whose behalf the pipeline is executed.
+        /// If None, pipeline write commands will not set a writer id.
+        subject_id: Option<EntityId>,
         respond_to: oneshot::Sender<Result<Vec<crate::models::PipelineResult>>>,
     },
 }
@@ -448,11 +451,12 @@ impl StoreHandle {
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service closed".to_string()))?
     }
 
-    pub async fn execute_pipeline(&self, commands: Vec<crate::models::PipelineCommand>) -> Result<Vec<crate::models::PipelineResult>> {
+    pub async fn execute_pipeline(&self, commands: Vec<crate::models::PipelineCommand>, subject_id: Option<EntityId>) -> Result<Vec<crate::models::PipelineResult>> {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(StoreCommand::ExecutePipeline {
                 commands,
+                subject_id,
                 respond_to: tx,
             })
             .map_err(|_| qlib_rs::Error::StoreProxyError("Service unavailable".to_string()))?;
@@ -818,14 +822,14 @@ impl StoreService {
                 self.proxy.unregister_notification(&config, &sender);
                 let _ = respond_to.send(Ok(()));
             }
-            StoreCommand::ExecutePipeline { commands, respond_to } => {
-                let result = self.execute_pipeline_commands(commands);
+            StoreCommand::ExecutePipeline { commands, subject_id, respond_to } => {
+                let result = self.execute_pipeline_commands(commands, subject_id);
                 self.send_result(result, respond_to);
             }
         }
     }
 
-    fn execute_pipeline_commands(&mut self, commands: Vec<crate::models::PipelineCommand>) -> Result<Vec<crate::models::PipelineResult>> {
+    fn execute_pipeline_commands(&mut self, commands: Vec<crate::models::PipelineCommand>, subject_id: Option<EntityId>) -> Result<Vec<crate::models::PipelineResult>> {
         use crate::models::{PipelineCommand, PipelineResult};
 
         let mut pipeline = self.proxy.pipeline();
@@ -840,7 +844,8 @@ impl StoreService {
                     command_types.push(("Read", None));
                 }
                 PipelineCommand::Write { entity_id, field, value } => {
-                    pipeline.write(entity_id, &[field], value.clone(), None, None, None, None)?;
+                    // Use subject_id as the writer when available
+                    pipeline.write(entity_id, &[field], value.clone(), subject_id, None, None, None)?;
                     command_types.push(("Write", None));
                 }
                 PipelineCommand::Create { entity_type, name } => {
