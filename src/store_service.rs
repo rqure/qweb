@@ -524,8 +524,6 @@ fn create_permission_cache(store: &StoreProxy) -> Option<qlib_rs::Cache> {
         }
     }
 }
-
-/// Service that wraps StoreProxy and runs in its own task
 pub struct StoreService {
     proxy: StoreProxy,
     receiver: mpsc::UnboundedReceiver<StoreCommand>,
@@ -534,6 +532,11 @@ pub struct StoreService {
     cel_executor: qlib_rs::CelExecutor,
     // Optional ServiceState used to write periodic heartbeats for this service
     service_state: Option<ServiceState>,
+    // Caches for entity type and field type mappings
+    entity_type_names: std::collections::HashMap<String, EntityType>,
+    entity_types: std::collections::HashMap<EntityType, String>,
+    field_type_names: std::collections::HashMap<String, FieldType>,
+    field_types: std::collections::HashMap<FieldType, String>,
 }
 
 impl StoreService {
@@ -546,6 +549,12 @@ impl StoreService {
         let mut proxy = proxy;
         let permission_cache = create_permission_cache(&proxy);
         let cel_executor = qlib_rs::CelExecutor::new();
+
+        // Initialize empty type caches - they will be populated lazily
+        let entity_type_names = std::collections::HashMap::new();
+        let entity_types = std::collections::HashMap::new();
+        let field_type_names = std::collections::HashMap::new();
+        let field_types = std::collections::HashMap::new();
 
         // Initialize ServiceState so qweb can write regular heartbeats. This uses the
         // same StoreProxy connection owned by the StoreService.
@@ -574,7 +583,18 @@ impl StoreService {
             }
         };
 
-        let service = StoreService { proxy, receiver, auth_config, permission_cache, cel_executor, service_state };
+        let service = StoreService { 
+            proxy, 
+            receiver, 
+            auth_config, 
+            permission_cache, 
+            cel_executor, 
+            service_state,
+            entity_type_names,
+            entity_types,
+            field_type_names,
+            field_types,
+        };
         (handle, service)
     }
 
@@ -628,26 +648,66 @@ impl StoreService {
     fn handle_command(&mut self, command: StoreCommand) {
         match command {
             StoreCommand::GetEntityType { name, respond_to } => {
-                let result = self.proxy.get_entity_type(&name);
-                self.send_result(result, respond_to);
+                // Check cache first
+                if let Some(entity_type) = self.entity_type_names.get(&name) {
+                    let _ = respond_to.send(Ok(*entity_type));
+                } else {
+                    // Not in cache, call proxy and cache the result
+                    let result = self.proxy.get_entity_type(&name);
+                    if let Ok(entity_type) = result {
+                        self.entity_type_names.insert(name.clone(), entity_type);
+                        self.entity_types.insert(entity_type, name);
+                    }
+                    self.send_result(result, respond_to);
+                }
             }
             StoreCommand::ResolveEntityType {
                 entity_type,
                 respond_to,
             } => {
-                let result = self.proxy.resolve_entity_type(entity_type);
-                self.send_result(result, respond_to);
+                // Check cache first
+                if let Some(name) = self.entity_types.get(&entity_type) {
+                    let _ = respond_to.send(Ok(name.clone()));
+                } else {
+                    // Not in cache, call proxy and cache the result
+                    let result = self.proxy.resolve_entity_type(entity_type);
+                    if let Ok(ref name) = result {
+                        self.entity_type_names.insert(name.clone(), entity_type);
+                        self.entity_types.insert(entity_type, name.clone());
+                    }
+                    self.send_result(result, respond_to);
+                }
             }
             StoreCommand::GetFieldType { name, respond_to } => {
-                let result = self.proxy.get_field_type(&name);
-                self.send_result(result, respond_to);
+                // Check cache first
+                if let Some(field_type) = self.field_type_names.get(&name) {
+                    let _ = respond_to.send(Ok(*field_type));
+                } else {
+                    // Not in cache, call proxy and cache the result
+                    let result = self.proxy.get_field_type(&name);
+                    if let Ok(field_type) = result {
+                        self.field_type_names.insert(name.clone(), field_type);
+                        self.field_types.insert(field_type, name);
+                    }
+                    self.send_result(result, respond_to);
+                }
             }
             StoreCommand::ResolveFieldType {
                 field_type,
                 respond_to,
             } => {
-                let result = self.proxy.resolve_field_type(field_type);
-                self.send_result(result, respond_to);
+                // Check cache first
+                if let Some(name) = self.field_types.get(&field_type) {
+                    let _ = respond_to.send(Ok(name.clone()));
+                } else {
+                    // Not in cache, call proxy and cache the result
+                    let result = self.proxy.resolve_field_type(field_type);
+                    if let Ok(ref name) = result {
+                        self.field_type_names.insert(name.clone(), field_type);
+                        self.field_types.insert(field_type, name.clone());
+                    }
+                    self.send_result(result, respond_to);
+                }
             }
             StoreCommand::GetEntitySchema {
                 entity_type,
