@@ -8,6 +8,7 @@ mod models;
 mod store_service;
 mod websocket;
 mod session_cleanup;
+mod session_service;
 
 use store_service::{StoreHandle, StoreService};
 
