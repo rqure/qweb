@@ -1,10 +1,10 @@
-use qlib_rs::{EntityId, Result, EntityType, FieldType, Value, NotifyConfig};
+use crossbeam::channel::{unbounded as crossbeam_unbounded, Receiver, Sender};
+use qlib_rs::{EntityId, EntityType, FieldType, NotifyConfig, Result, Value};
 use std::collections::HashMap;
-use tokio::sync::{oneshot, mpsc};
-use crossbeam::channel::{unbounded as crossbeam_unbounded, Sender, Receiver};
+use tokio::sync::{mpsc, oneshot};
 
-use crate::store_service::StoreHandle;
 use crate::models::PipelineCommand;
+use crate::store_service::StoreHandle;
 
 struct ET {
     pub session_controller: EntityType,
@@ -25,9 +25,18 @@ struct FT {
 }
 
 pub enum SessionCommand {
-    Login { user_id: EntityId, respond_to: tokio::sync::oneshot::Sender<Result<EntityId>> },
-    Logout { user_id: EntityId, respond_to: tokio::sync::oneshot::Sender<Result<()>> },
-    RefreshSession { user_id: EntityId, respond_to: tokio::sync::oneshot::Sender<Result<()>> },
+    Login {
+        user_id: EntityId,
+        respond_to: tokio::sync::oneshot::Sender<Result<EntityId>>,
+    },
+    Logout {
+        user_id: EntityId,
+        respond_to: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    RefreshSession {
+        user_id: EntityId,
+        respond_to: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 
 pub struct SessionService {
@@ -54,8 +63,22 @@ impl SessionService {
         let service = Self {
             store,
             receiver,
-            et: ET { session_controller: EntityType(0), session: EntityType(0), user: EntityType(0) }, // placeholder
-            ft: FT { request_login_user: FieldType(0), response_login_user: FieldType(0), response_login_session: FieldType(0), request_logout_user: FieldType(0), response_logout_user: FieldType(0), response_logout_session: FieldType(0), request_refresh_user: FieldType(0), response_refresh_user: FieldType(0), response_refresh_session: FieldType(0) }, // placeholder
+            et: ET {
+                session_controller: EntityType(0),
+                session: EntityType(0),
+                user: EntityType(0),
+            }, // placeholder
+            ft: FT {
+                request_login_user: FieldType(0),
+                response_login_user: FieldType(0),
+                response_login_session: FieldType(0),
+                request_logout_user: FieldType(0),
+                response_logout_user: FieldType(0),
+                response_logout_session: FieldType(0),
+                request_refresh_user: FieldType(0),
+                response_refresh_user: FieldType(0),
+                response_refresh_session: FieldType(0),
+            }, // placeholder
             session_controller_id: EntityId(0), // placeholder
             notify_sender,
             notify_receiver,
@@ -69,47 +92,105 @@ impl SessionService {
     pub async fn run(&mut self) {
         // Initialize ET and FT
         self.et = ET {
-            session_controller: self.store.get_entity_type("SessionController").await.unwrap(),
+            session_controller: self
+                .store
+                .get_entity_type("SessionController")
+                .await
+                .unwrap(),
             session: self.store.get_entity_type("Session").await.unwrap(),
             user: self.store.get_entity_type("User").await.unwrap(),
         };
         self.ft = FT {
             request_login_user: self.store.get_field_type("RequestLoginUser").await.unwrap(),
-            response_login_user: self.store.get_field_type("ResponseLoginUser").await.unwrap(),
-            response_login_session: self.store.get_field_type("ResponseLoginSession").await.unwrap(),
-            request_logout_user: self.store.get_field_type("RequestLogoutUser").await.unwrap(),
-            response_logout_user: self.store.get_field_type("ResponseLogoutUser").await.unwrap(),
-            response_logout_session: self.store.get_field_type("ResponseLogoutSession").await.unwrap(),
-            request_refresh_user: self.store.get_field_type("RequestRefreshUser").await.unwrap(),
-            response_refresh_user: self.store.get_field_type("ResponseRefreshUser").await.unwrap(),
-            response_refresh_session: self.store.get_field_type("ResponseRefreshSession").await.unwrap(),
+            response_login_user: self
+                .store
+                .get_field_type("ResponseLoginUser")
+                .await
+                .unwrap(),
+            response_login_session: self
+                .store
+                .get_field_type("ResponseLoginSession")
+                .await
+                .unwrap(),
+            request_logout_user: self
+                .store
+                .get_field_type("RequestLogoutUser")
+                .await
+                .unwrap(),
+            response_logout_user: self
+                .store
+                .get_field_type("ResponseLogoutUser")
+                .await
+                .unwrap(),
+            response_logout_session: self
+                .store
+                .get_field_type("ResponseLogoutSession")
+                .await
+                .unwrap(),
+            request_refresh_user: self
+                .store
+                .get_field_type("RequestRefreshUser")
+                .await
+                .unwrap(),
+            response_refresh_user: self
+                .store
+                .get_field_type("ResponseRefreshUser")
+                .await
+                .unwrap(),
+            response_refresh_session: self
+                .store
+                .get_field_type("ResponseRefreshSession")
+                .await
+                .unwrap(),
         };
 
         // Find SessionController entity
-        let controllers = self.store.find_entities(self.et.session_controller, None).await.unwrap();
+        let controllers = self
+            .store
+            .find_entities(self.et.session_controller, None)
+            .await
+            .unwrap();
         self.session_controller_id = controllers[0];
 
         // Register notifications
-        self.store.register_notification(NotifyConfig::EntityType {
-            entity_type: self.et.session_controller,
-            field_type: self.ft.response_login_session,
-            trigger_on_change: false,
-            context: vec![vec![self.ft.response_login_user]],
-        }, self.notify_sender.clone()).await.unwrap();
+        self.store
+            .register_notification(
+                NotifyConfig::EntityType {
+                    entity_type: self.et.session_controller,
+                    field_type: self.ft.response_login_session,
+                    trigger_on_change: false,
+                    context: vec![vec![self.ft.response_login_user]],
+                },
+                self.notify_sender.clone(),
+            )
+            .await
+            .unwrap();
 
-        self.store.register_notification(NotifyConfig::EntityType {
-            entity_type: self.et.session_controller,
-            field_type: self.ft.response_logout_session,
-            trigger_on_change: false,
-            context: vec![vec![self.ft.response_logout_user]],
-        }, self.notify_sender.clone()).await.unwrap();
+        self.store
+            .register_notification(
+                NotifyConfig::EntityType {
+                    entity_type: self.et.session_controller,
+                    field_type: self.ft.response_logout_session,
+                    trigger_on_change: false,
+                    context: vec![vec![self.ft.response_logout_user]],
+                },
+                self.notify_sender.clone(),
+            )
+            .await
+            .unwrap();
 
-        self.store.register_notification(NotifyConfig::EntityType {
-            entity_type: self.et.session_controller,
-            field_type: self.ft.response_refresh_session,
-            trigger_on_change: false,
-            context: vec![vec![self.ft.response_refresh_user]],
-        }, self.notify_sender.clone()).await.unwrap();
+        self.store
+            .register_notification(
+                NotifyConfig::EntityType {
+                    entity_type: self.et.session_controller,
+                    field_type: self.ft.response_refresh_session,
+                    trigger_on_change: false,
+                    context: vec![vec![self.ft.response_refresh_user]],
+                },
+                self.notify_sender.clone(),
+            )
+            .await
+            .unwrap();
 
         loop {
             // Process all available commands
@@ -122,9 +203,14 @@ impl SessionService {
                 self.handle_notification(notification);
             }
         }
-    }    async fn handle_command(&mut self, command: SessionCommand) {
+    }
+    
+    async fn handle_command(&mut self, command: SessionCommand) {
         match command {
-            SessionCommand::Login { user_id, respond_to } => {
+            SessionCommand::Login {
+                user_id,
+                respond_to,
+            } => {
                 let commands = vec![PipelineCommand::Write {
                     entity_id: self.session_controller_id,
                     field: self.ft.request_login_user,
@@ -133,7 +219,10 @@ impl SessionService {
                 self.store.execute_pipeline(commands, None).await.unwrap();
                 self.pending_logins.insert(user_id, respond_to);
             }
-            SessionCommand::Logout { user_id, respond_to } => {
+            SessionCommand::Logout {
+                user_id,
+                respond_to,
+            } => {
                 let commands = vec![PipelineCommand::Write {
                     entity_id: self.session_controller_id,
                     field: self.ft.request_logout_user,
@@ -142,7 +231,10 @@ impl SessionService {
                 self.store.execute_pipeline(commands, None).await.unwrap();
                 self.pending_logouts.insert(user_id, respond_to);
             }
-            SessionCommand::RefreshSession { user_id, respond_to } => {
+            SessionCommand::RefreshSession {
+                user_id,
+                respond_to,
+            } => {
                 let commands = vec![PipelineCommand::Write {
                     entity_id: self.session_controller_id,
                     field: self.ft.request_refresh_user,
@@ -159,7 +251,8 @@ impl SessionService {
         if field == self.ft.response_login_session {
             if let Some(value) = &notification.current.value {
                 if let Value::EntityReference(Some(session_id)) = value {
-                    if let Some(info) = notification.context.get(&vec![self.ft.response_login_user]) {
+                    if let Some(info) = notification.context.get(&vec![self.ft.response_login_user])
+                    {
                         if let Some(val) = &info.value {
                             if let Value::EntityReference(Some(user_id)) = val {
                                 if let Some(sender) = self.pending_logins.remove(user_id) {
@@ -171,7 +264,10 @@ impl SessionService {
                 }
             }
         } else if field == self.ft.response_logout_session {
-            if let Some(info) = notification.context.get(&vec![self.ft.response_logout_user]) {
+            if let Some(info) = notification
+                .context
+                .get(&vec![self.ft.response_logout_user])
+            {
                 if let Some(val) = &info.value {
                     if let Value::EntityReference(Some(user_id)) = val {
                         if let Some(sender) = self.pending_logouts.remove(user_id) {
@@ -181,7 +277,10 @@ impl SessionService {
                 }
             }
         } else if field == self.ft.response_refresh_session {
-            if let Some(info) = notification.context.get(&vec![self.ft.response_refresh_user]) {
+            if let Some(info) = notification
+                .context
+                .get(&vec![self.ft.response_refresh_user])
+            {
                 if let Some(val) = &info.value {
                     if let Value::EntityReference(Some(user_id)) = val {
                         if let Some(sender) = self.pending_refreshes.remove(user_id) {
