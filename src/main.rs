@@ -1,21 +1,19 @@
 use actix_web::{web, App, HttpServer};
 use actix_cors::Cors;
 use log::{error, info};
-use qlib_rs::{StoreProxy, EntityId};
+use qlib_rs::StoreProxy;
 
 mod handlers;
 mod models;
 mod store_service;
 mod websocket;
-mod session_cleanup;
 mod session_service;
 
 use store_service::{StoreHandle, StoreService};
 
 pub struct AppState {
     store_handle: StoreHandle,
-    jwt_secret: String,
-    qweb_service_id: EntityId,
+    session_handle: session_service::SessionHandle,
 }
 
 #[actix_web::main]
@@ -42,41 +40,29 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    let jwt_secret = std::env::var("JWT_SECRET")
-        .unwrap_or_else(|_| "default_secret".to_string());
-
-    info!("JWT secret configured");
-
     // Create StoreService and get handle. StoreService will initialize a ServiceState
     // using the same StoreProxy connection so qweb can write periodic heartbeats.
     let (store_handle, mut store_service) = StoreService::new(store_proxy);
-
-    // Try to obtain the Service entity id from the initialized ServiceState. This avoids
-    // performing an extra lookup here; if ServiceState initialization failed we'll fall
-    // back to the asynchronous handle-based discovery as before.
-    let qweb_service_id = if let Some(id) = store_service.get_service_id() {
-        info!("Determined qweb service ID from ServiceState: {:?}", id);
-        id
-    } else {
-        error!("Failed to determine qweb service ID from ServiceState");
-        std::process::exit(1);
-    };
 
     // Spawn the StoreService in a separate task
     tokio::spawn(async move {
         store_service.run().await;
     });
 
-    let app_state = web::Data::new(AppState { 
-        store_handle: store_handle.clone(), 
-        jwt_secret,
-        qweb_service_id,
+    // Create SessionService and spawn it
+    let (session_handle, mut session_service) = session_service::SessionService::new(store_handle.clone());
+    tokio::spawn(async move {
+        session_service.run().await;
     });
 
-        // Start session cleanup task
-    let cleanup_handle = store_handle.clone();
-    tokio::spawn(async move {
-        session_cleanup::session_cleanup_task(cleanup_handle, qweb_service_id).await;
+    // Wait a bit for SessionService to initialize and load JWT secret
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    info!("SessionService initialized and JWT secret cached");
+
+    let app_state = web::Data::new(AppState { 
+        store_handle: store_handle.clone(),
+        session_handle,
     });
 
     let bind_address = std::env::var("BIND_ADDRESS")

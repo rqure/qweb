@@ -16,177 +16,47 @@ pub async fn login(state: web::Data<AppState>, req: web::Json<LoginRequest>) -> 
 
     // Authenticate the user
     let user_id = match handle.authenticate_user(&req.username, &req.password).await {
-        Ok(entity_id) => entity_id,
-        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Authentication failed: {:?}", e))),
-    };
-
-    // Find Session entity type
-    let session_entity_type = match handle.get_entity_type("Session").await {
-        Ok(et) => et,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Session entity type: {:?}", e))),
-    };
-
-    // Get field types
-    let current_user_field_type = match handle.get_field_type("CurrentUser").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get CurrentUser field type: {:?}", e))),
-    };
-
-    let previous_user_field_type = match handle.get_field_type("PreviousUser").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get PreviousUser field type: {:?}", e))),
-    };
-
-    let token_field_type = match handle.get_field_type("Token").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Token field type: {:?}", e))),
-    };
-
-    let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
-    };
-
-    let created_at_field_type = match handle.get_field_type("CreatedAt").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get CreatedAt field type: {:?}", e))),
-    };
-
-    // Find an available Session owned by this qweb instance (CurrentUser field is None and Parent matches this qweb service)
-    let filter = format!("CurrentUser == 0 && Parent == {}", state.qweb_service_id.0);
-    let available_sessions = match handle.find_entities(session_entity_type, Some(&filter)).await {
-        Ok(entities) => entities,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to find available sessions: {:?}", e))),
-    };
-
-    log::info!("Login attempt - qweb_service_id: {:?}, filter: '{}', found {} sessions", state.qweb_service_id, filter, available_sessions.len());
-    if !available_sessions.is_empty() {
-        log::info!("Available session IDs: {:?}", available_sessions.iter().map(|id| id.0).collect::<Vec<_>>());
-    }
-
-    let session_id = if let Some(&id) = available_sessions.first() {
-        id
-    } else {
-        return HttpResponse::ServiceUnavailable().json(ApiResponse::<()>::error("No available sessions. Maximum concurrent users reached.".to_string()))
-    };
-
-    // Store PreviousUser before assigning new user
-    let previous_user = match handle.read(session_id, &[current_user_field_type]).await {
-        Ok((qlib_rs::Value::EntityReference(prev_user), _, _)) => prev_user,
-        _ => None,
-    };
-
-    if let Some(prev_user_id) = previous_user {
-        if let Err(e) = handle.write(session_id, &[previous_user_field_type], qlib_rs::Value::EntityReference(Some(prev_user_id)), Some(user_id), None, None, None).await {
-            return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to store previous user: {:?}", e)));
+        Ok(id) => id,
+        Err(e) => {
+            log::error!("Authentication failed: {:?}", e);
+            return HttpResponse::Unauthorized().json(ApiResponse::<LoginResponse>::error("Invalid credentials".to_string()));
         }
-    }
-
-    // Create JWT with session_id in claims - 1 minute timeout
-    use jsonwebtoken::{encode, Header, EncodingKey};
-    let expiration = chrono::Utc::now() + chrono::Duration::minutes(1);
-    let claims = serde_json::json!({
-        "sub": user_id.0.to_string(),
-        "session_id": session_id.0.to_string(),
-        "exp": expiration.timestamp() as usize,
-    });
-    let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(state.jwt_secret.as_bytes())) {
-        Ok(t) => t,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to generate token: {:?}", e))),
     };
 
-    // Read PreviousUser to preserve it
-    let previous_user_value = match handle.read(session_id, &[previous_user_field_type]).await {
-        Ok((value, _, _)) => value,
-        Err(_) => qlib_rs::Value::EntityReference(None),
+    // Request login via SessionController (qsession_manager will handle it and generate JWT)
+    let (session_id, token) = match state.session_handle.login(user_id).await {
+        Ok((sid, tok)) => (sid, tok),
+        Err(e) => {
+            log::error!("Session login failed: {:?}", e);
+            return HttpResponse::InternalServerError().json(ApiResponse::<LoginResponse>::error("Failed to create session".to_string()));
+        }
     };
 
-    // Update Session entity with CurrentUser reference, preserve or set PreviousUser, token, and timestamps
-    if let Err(e) = handle.write(session_id, &[current_user_field_type], qlib_rs::Value::EntityReference(Some(user_id)), Some(user_id), None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to assign user to session: {:?}", e)));
-    }
-
-    // Set PreviousUser to the previous CurrentUser if there was one
-    let prev_user = match previous_user_value {
-        qlib_rs::Value::EntityReference(Some(prev_id)) => Some(prev_id),
-        _ => None,
-    };
-    if let Err(e) = handle.write(session_id, &[previous_user_field_type], qlib_rs::Value::EntityReference(prev_user), Some(user_id), None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to set previous user: {:?}", e)));
-    }
-
-    if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), Some(user_id), None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to store token: {:?}", e)));
-    }
-
-    let now = qlib_rs::epoch();
-    if let Err(e) = handle.write(session_id, &[created_at_field_type], qlib_rs::Value::Timestamp(now), Some(user_id), None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to store created timestamp: {:?}", e)));
-    }
-
-    let expiration_timestamp = qlib_rs::millis_to_timestamp(expiration.timestamp_millis() as u64);
-    if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), Some(user_id), None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to store expiration: {:?}", e)));
-    }
-
+    log::info!("Login successful for user {:?}, session {:?}", user_id, session_id);
     HttpResponse::Ok().json(ApiResponse::success(LoginResponse { token }))
 }
 
 pub async fn logout(req: HttpRequest, state: web::Data<AppState>, _body: web::Json<LogoutRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    // Extract subject and session_id from token
-    let (user_id, session_id) = match get_subject_and_session_from_request(&req, &state.jwt_secret, handle).await {
+    // Get subject from JWT
+    let (subject_id, _session_id) = match get_subject_and_session_from_request(&req, &jwt_secret, handle).await {
         Ok((uid, sid)) => (uid, sid),
-        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Invalid token: {}", e))),
-    };
-
-    // Get field types
-    let current_user_field_type = match handle.get_field_type("CurrentUser").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get CurrentUser field type: {:?}", e))),
-    };
-
-    let previous_user_field_type = match handle.get_field_type("PreviousUser").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get PreviousUser field type: {:?}", e))),
-    };
-
-    let token_field_type = match handle.get_field_type("Token").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Token field type: {:?}", e))),
-    };
-
-    let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
-    };
-
-    // Save CurrentUser to PreviousUser before logout
-    let current_user = match handle.read(session_id, &[current_user_field_type]).await {
-        Ok((qlib_rs::Value::EntityReference(user), _, _)) => user,
-        _ => None,
-    };
-
-    if let Some(current_user_id) = current_user {
-        if let Err(e) = handle.write(session_id, &[previous_user_field_type], qlib_rs::Value::EntityReference(Some(current_user_id)), Some(user_id), None, None, None).await {
-            return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to save previous user: {:?}", e)));
+        Err(e) => {
+            log::error!("Failed to get subject from request: {:?}", e);
+            return HttpResponse::Unauthorized().json(ApiResponse::<()>::error("Invalid token".to_string()));
         }
+    };
+
+    // Request logout via SessionController (qsession_manager manages all sessions)
+    if let Err(e) = state.session_handle.logout(subject_id).await {
+        log::error!("Session logout failed: {:?}", e);
+        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error("Failed to logout".to_string()));
     }
 
-    // Clear the Session by setting CurrentUser to None, clearing token and resetting expiration
-    if let Err(e) = handle.write(session_id, &[current_user_field_type], qlib_rs::Value::EntityReference(None), Some(user_id), None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to clear session user: {:?}", e)));
-    }
-
-    if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String("".to_string()), Some(user_id), None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to clear token: {:?}", e)));
-    }
-
-    if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(qlib_rs::epoch()), Some(user_id), None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to clear expiration: {:?}", e)));
-    }
-
+    log::info!("Logout successful for user {:?}", subject_id);
     HttpResponse::Ok().json(ApiResponse::success(serde_json::json!({
         "message": "Successfully logged out"
     })))
@@ -194,66 +64,37 @@ pub async fn logout(req: HttpRequest, state: web::Data<AppState>, _body: web::Js
 
 pub async fn refresh(req: HttpRequest, state: web::Data<AppState>, _body: web::Json<RefreshRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    // Extract and validate the existing token
-    let (user_id, session_id) = match get_subject_and_session_from_request(&req, &state.jwt_secret, handle).await {
+    // Get subject from JWT
+    let (subject_id, _session_id) = match get_subject_and_session_from_request(&req, &jwt_secret, handle).await {
         Ok((uid, sid)) => (uid, sid),
-        Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(format!("Invalid token: {}", e))),
+        Err(e) => {
+            log::error!("Failed to get subject from request: {:?}", e);
+            return HttpResponse::Unauthorized().json(ApiResponse::<LoginResponse>::error("Invalid token".to_string()));
+        }
     };
 
-    // Verify this qweb instance owns the session
-    let parent_field_type = match handle.get_field_type("Parent").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Parent field type: {:?}", e))),
+    // Request refresh via SessionController (qsession_manager manages all sessions and will generate new JWT)
+    let token = match state.session_handle.refresh_session(subject_id).await {
+        Ok(tok) => tok,
+        Err(e) => {
+            log::error!("Session refresh failed: {:?}", e);
+            return HttpResponse::InternalServerError().json(ApiResponse::<LoginResponse>::error("Failed to refresh session".to_string()));
+        }
     };
 
-    match check_session_ownership(handle, session_id, state.qweb_service_id, parent_field_type).await {
-        Ok(true) => {}, // Session is owned by this instance
-        Ok(false) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error("Session belongs to different qweb instance".to_string())),
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to verify session ownership: {}", e))),
-    }
-
-    let token_field_type = match handle.get_field_type("Token").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get Token field type: {:?}", e))),
-    };
-
-    let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
-        Ok(ft) => ft,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to get ExpiresAt field type: {:?}", e))),
-    };
-
-    // Issue a new token with extended expiration (1 minute)
-    use jsonwebtoken::{encode, Header, EncodingKey};
-    let expiration = chrono::Utc::now() + chrono::Duration::minutes(1);
-    let claims = serde_json::json!({
-        "sub": user_id.0.to_string(),
-        "session_id": session_id.0.to_string(),
-        "exp": expiration.timestamp() as usize,
-    });
-    
-    let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(state.jwt_secret.as_bytes())) {
-        Ok(t) => t,
-        Err(e) => return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to generate token: {:?}", e))),
-    };
-
-    // Update Session with new token and expiration
-    if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), None, None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to update token: {:?}", e)));
-    }
-
-    let expiration_timestamp = qlib_rs::millis_to_timestamp(expiration.timestamp_millis() as u64);
-    if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), None, None, None, None).await {
-        return HttpResponse::InternalServerError().json(ApiResponse::<()>::error(format!("Failed to update expiration: {:?}", e)));
-    }
-
+    log::info!("Refresh successful for user {:?}", subject_id);
     HttpResponse::Ok().json(ApiResponse::success(LoginResponse { token }))
 }
 
 pub async fn read(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ReadRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -321,8 +162,10 @@ pub async fn read(req: HttpRequest, state: web::Data<AppState>, body: web::Json<
 
 pub async fn write(req: HttpRequest, state: web::Data<AppState>, body: web::Json<WriteRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -351,8 +194,10 @@ pub async fn write(req: HttpRequest, state: web::Data<AppState>, body: web::Json
 
 pub async fn create(req: HttpRequest, state: web::Data<AppState>, body: web::Json<CreateRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -382,8 +227,10 @@ pub async fn create(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
 
 pub async fn delete(req: HttpRequest, state: web::Data<AppState>, body: web::Json<DeleteRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -410,8 +257,10 @@ pub async fn delete(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
 
 pub async fn find(req: HttpRequest, state: web::Data<AppState>, body: web::Json<FindRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -442,8 +291,10 @@ pub async fn find(req: HttpRequest, state: web::Data<AppState>, body: web::Json<
 
 pub async fn schema(req: HttpRequest, state: web::Data<AppState>, body: web::Json<SchemaRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -464,8 +315,10 @@ pub async fn schema(req: HttpRequest, state: web::Data<AppState>, body: web::Jso
 
 pub async fn complete_schema(req: HttpRequest, state: web::Data<AppState>, body: web::Json<CompleteSchemaRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -486,8 +339,10 @@ pub async fn complete_schema(req: HttpRequest, state: web::Data<AppState>, body:
 
 pub async fn update_schema(req: HttpRequest, state: web::Data<AppState>, body: web::Json<UpdateSchemaRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -503,8 +358,10 @@ pub async fn update_schema(req: HttpRequest, state: web::Data<AppState>, body: w
 
 pub async fn get_entity_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<GetEntityTypeRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _user_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _user_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(uid) => uid,
         Err(_) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error("Unauthorized".to_string())),
     };
@@ -519,8 +376,10 @@ pub async fn get_entity_type(req: HttpRequest, state: web::Data<AppState>, body:
 
 pub async fn resolve_entity_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ResolveEntityTypeRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -538,8 +397,10 @@ pub async fn resolve_entity_type(req: HttpRequest, state: web::Data<AppState>, b
 
 pub async fn get_field_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<GetFieldTypeRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _user_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _user_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(uid) => uid,
         Err(_) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error("Unauthorized".to_string())),
     };
@@ -554,8 +415,10 @@ pub async fn get_field_type(req: HttpRequest, state: web::Data<AppState>, body: 
 
 pub async fn resolve_field_type(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ResolveFieldTypeRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -573,8 +436,10 @@ pub async fn resolve_field_type(req: HttpRequest, state: web::Data<AppState>, bo
 
 pub async fn get_field_schema(req: HttpRequest, state: web::Data<AppState>, body: web::Json<GetFieldSchemaRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -597,8 +462,10 @@ pub async fn get_field_schema(req: HttpRequest, state: web::Data<AppState>, body
 
 pub async fn entity_exists(req: HttpRequest, state: web::Data<AppState>, body: web::Json<EntityExistsRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -614,8 +481,10 @@ pub async fn entity_exists(req: HttpRequest, state: web::Data<AppState>, body: w
 
 pub async fn field_exists(req: HttpRequest, state: web::Data<AppState>, body: web::Json<FieldExistsRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -633,8 +502,10 @@ pub async fn field_exists(req: HttpRequest, state: web::Data<AppState>, body: we
 
 pub async fn resolve_indirection(req: HttpRequest, state: web::Data<AppState>, body: web::Json<ResolveIndirectionRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let _subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let _subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => return HttpResponse::Unauthorized().json(ApiResponse::<()>::error(e)),
     };
@@ -654,8 +525,10 @@ pub async fn resolve_indirection(req: HttpRequest, state: web::Data<AppState>, b
 
 pub async fn pipeline(req: HttpRequest, state: web::Data<AppState>, body: web::Json<crate::models::PipelineRequest>) -> impl Responder {
     let handle = &state.store_handle;
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
 
-    let subject_id = match get_subject_from_request(&req, &state.jwt_secret) {
+    let subject_id = match get_subject_from_request(&req, &jwt_secret) {
         Ok(id) => id,
         Err(e) => {
             return HttpResponse::Unauthorized().json(crate::models::ApiResponse::<()>::error(e));
@@ -665,26 +538,6 @@ pub async fn pipeline(req: HttpRequest, state: web::Data<AppState>, body: web::J
     match handle.execute_pipeline(body.commands.clone(), Some(subject_id)).await {
         Ok(results) => HttpResponse::Ok().json(crate::models::ApiResponse::success(crate::models::PipelineResponse { results })),
         Err(e) => HttpResponse::InternalServerError().json(crate::models::ApiResponse::<()>::error(format!("{:?}", e))),
-    }
-}
-
-/// Check if a session belongs to this qweb instance
-/// Sessions always belong to their parent qweb service (never transfer Parent)
-/// Returns true if owned by this instance, false otherwise
-async fn check_session_ownership(
-    handle: &crate::store_service::StoreHandle,
-    session_id: EntityId,
-    qweb_service_id: EntityId,
-    parent_field_type: FieldType,
-) -> Result<bool, String> {
-    // Read the session's parent to check ownership
-    let (parent_value, _, _) = handle.read(session_id, &[parent_field_type]).await
-        .map_err(|e| format!("Failed to read session parent: {:?}", e))?;
-    
-    if let qlib_rs::Value::EntityReference(Some(parent_id)) = parent_value {
-        Ok(parent_id == qweb_service_id)
-    } else {
-        Err("Session has no parent".to_string())
     }
 }
 

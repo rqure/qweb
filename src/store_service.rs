@@ -598,11 +598,6 @@ impl StoreService {
         (handle, service)
     }
 
-    /// Return the EntityId for the initialized Service instance, if available.
-    pub fn get_service_id(&self) -> Option<EntityId> {
-        self.service_state.as_ref().map(|s| s.service_id)
-    }
-
     fn send_result<T>(&self, result: Result<T>, respond_to: oneshot::Sender<Result<T>>)
     where
         T: Send + 'static,

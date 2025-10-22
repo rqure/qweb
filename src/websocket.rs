@@ -14,26 +14,6 @@ use crate::AppState;
 
 use qlib_rs::{auth::AuthorizationScope, EntityId, EntityType, FieldType, NotifyConfig, Value};
 
-/// Check session ownership for websocket connections
-async fn check_websocket_session_ownership(
-    handle: &StoreHandle,
-    session_id: EntityId,
-    qweb_service_id: EntityId,
-) -> Result<bool, String> {
-    let parent_field_type = handle.get_field_type("Parent").await
-        .map_err(|e| format!("Failed to get Parent field type: {:?}", e))?;
-    
-    // Check if session belongs to this qweb instance
-    let (parent_value, _, _) = handle.read(session_id, &[parent_field_type]).await
-        .map_err(|e| format!("Failed to read session parent: {:?}", e))?;
-    
-    if let qlib_rs::Value::EntityReference(Some(parent_id)) = parent_value {
-        Ok(parent_id == qweb_service_id)
-    } else {
-        Err("Session has no parent".to_string())
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct WsRequestWrapper {
     request_id: Option<String>,
@@ -103,23 +83,13 @@ pub async fn ws_handler(
     let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body)?;
 
     let handle = state.store_handle.clone();
-    // copy qweb service id so the spawned task can use it as a fallback writer id
-    let qweb_service_id = state.qweb_service_id;
-    let (subject_id, ws_session_id) = match crate::handlers::get_subject_and_session_from_request(&req, &state.jwt_secret, &handle).await {
-        Ok((uid, sid)) => {
-            // Verify session ownership
-            match check_websocket_session_ownership(&handle, sid, state.qweb_service_id).await {
-                Ok(true) => (Some(uid), Some(sid)),
-                Ok(false) => {
-                    error!("Session belongs to different qweb instance");
-                    (None, None)
-                }
-                Err(e) => {
-                    error!("Failed to verify session ownership: {}", e);
-                    (None, None)
-                }
-            }
-        }
+    let session_handle = state.session_handle.clone();
+    
+    // Get JWT secret from SessionService
+    let jwt_secret = state.session_handle.get_jwt_secret().await;
+    
+    let (subject_id, ws_session_id) = match crate::handlers::get_subject_and_session_from_request(&req, &jwt_secret, &handle).await {
+        Ok((uid, sid)) => (Some(uid), Some(sid)),
         Err(_) => (None, None),
     };
     
@@ -183,7 +153,7 @@ pub async fn ws_handler(
                 Message::Text(text) => {
                     let response = match serde_json::from_str::<WsRequestWrapper>(&text) {
                         Ok(wrapper) => {
-                            handle_ws_request(wrapper.request, wrapper.request_id, &handle, &crossbeam_sender, &registered_configs, subject_id, ws_session_id).await
+                            handle_ws_request(wrapper.request, wrapper.request_id, &handle, &session_handle, &crossbeam_sender, &registered_configs, subject_id, ws_session_id).await
                         }
                         Err(e) => WsResponse::error(None, format!("Invalid JSON: {}", e)),
                     };
@@ -216,31 +186,13 @@ pub async fn ws_handler(
             }
         }
 
-        // Auto-logout: Clear session on disconnect
-        if let Some(ws_session_id) = ws_session_id {
-            info!("WebSocket disconnected, auto-logging out session: {:?}", ws_session_id);
-            
-            // Get field types
-            if let (Ok(current_user_ft), Ok(previous_user_ft), Ok(token_ft), Ok(expires_at_ft)) = (
-                handle.get_field_type("CurrentUser").await,
-                handle.get_field_type("PreviousUser").await,
-                handle.get_field_type("Token").await,
-                handle.get_field_type("ExpiresAt").await,
-            ) {
-                // Save CurrentUser to PreviousUser
-                // Use the authenticated subject as the writer if available, otherwise fall back to the qweb service id
-                let writer = subject_id.unwrap_or(qweb_service_id);
-                if let Ok((qlib_rs::Value::EntityReference(Some(user_id)), _, _)) = handle.read(ws_session_id, &[current_user_ft]).await {
-                    let _ = handle.write(ws_session_id, &[previous_user_ft], qlib_rs::Value::EntityReference(Some(user_id)), Some(writer), None, None, None).await;
-                }
-                
-                // Clear the session
-                let _ = handle.write(ws_session_id, &[current_user_ft], qlib_rs::Value::EntityReference(None), Some(writer), None, None, None).await;
-                let _ = handle.write(ws_session_id, &[token_ft], qlib_rs::Value::String("".to_string()), Some(writer), None, None, None).await;
-                let _ = handle.write(ws_session_id, &[expires_at_ft], qlib_rs::Value::Timestamp(qlib_rs::epoch()), Some(writer), None, None, None).await;
+        // Logout to trigger immediate session cleanup in qsession_manager
+        if let Some(user_id) = subject_id {
+            if let Err(e) = session_handle.logout(user_id).await {
+                error!("Failed to logout on WebSocket disconnect: {:?}", e);
             }
         }
-
+        
         info!("WebSocket connection terminated");
     });
 
@@ -251,6 +203,7 @@ async fn handle_ws_request(
     request: WsRequest,
     request_id: Option<String>,
     handle: &StoreHandle,
+    session_handle: &crate::session_service::SessionHandle,
     notification_sender: &channel::Sender<qlib_rs::Notification>,
     registered_configs: &Arc<RwLock<HashMap<u64, qlib_rs::NotifyConfig>>>,
     subject_id: Option<qlib_rs::EntityId>,
@@ -266,48 +219,16 @@ async fn handle_ws_request(
                 None => return WsResponse::error(request_id.clone(), "Not authenticated".to_string()),
             };
 
-            let session_id = match session_id {
+            let _session_id = match session_id {
                 Some(id) => id,
                 None => return WsResponse::error(request_id.clone(), "No session".to_string()),
             };
 
-            // Issue a new token with extended expiration
-            use jsonwebtoken::{encode, Header, EncodingKey};
-            
-            let jwt_secret = std::env::var("JWT_SECRET")
-                .unwrap_or_else(|_| "default_secret".to_string());
-            
-            let expiration = chrono::Utc::now() + chrono::Duration::minutes(1);
-            let claims = serde_json::json!({
-                "sub": user_id.0.to_string(),
-                "session_id": session_id.0.to_string(),
-                "exp": expiration.timestamp() as usize,
-            });
-            
-            let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(jwt_secret.as_bytes())) {
-                Ok(t) => t,
-                Err(e) => return WsResponse::error(request_id.clone(), format!("Failed to generate token: {:?}", e)),
+            // Request refresh via SessionController (qsession_manager will generate new JWT)
+            let token = match session_handle.refresh_session(user_id).await {
+                Ok(tok) => tok,
+                Err(e) => return WsResponse::error(request_id.clone(), format!("Session refresh failed: {:?}", e)),
             };
-
-            // Update Session with new token and expiration
-            let token_field_type = match handle.get_field_type("Token").await {
-                Ok(ft) => ft,
-                Err(e) => return WsResponse::error(request_id.clone(), format!("Failed to get Token field type: {:?}", e)),
-            };
-
-            let expires_at_field_type = match handle.get_field_type("ExpiresAt").await {
-                Ok(ft) => ft,
-                Err(e) => return WsResponse::error(request_id.clone(), format!("Failed to get ExpiresAt field type: {:?}", e)),
-            };
-
-            if let Err(e) = handle.write(session_id, &[token_field_type], qlib_rs::Value::String(token.clone()), Some(user_id), None, None, None).await {
-                return WsResponse::error(request_id.clone(), format!("Failed to update token: {:?}", e));
-            }
-
-            let expiration_timestamp = qlib_rs::millis_to_timestamp(expiration.timestamp_millis() as u64);
-            if let Err(e) = handle.write(session_id, &[expires_at_field_type], qlib_rs::Value::Timestamp(expiration_timestamp), Some(user_id), None, None, None).await {
-                return WsResponse::error(request_id.clone(), format!("Failed to update expiration: {:?}", e));
-            }
 
             WsResponse::success(request_id.clone(), serde_json::json!({
                 "token": token
