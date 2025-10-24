@@ -96,14 +96,76 @@ pub async fn ws_handler(
     rt::spawn(async move {
         info!("WebSocket connection established");
 
-        // Create channels for notifications
+        // Create channels for client notifications
         let (crossbeam_sender, crossbeam_receiver) = channel::unbounded::<qlib_rs::Notification>();
         let (tokio_sender, mut tokio_receiver) = mpsc::unbounded_channel::<qlib_rs::Notification>();
+
+        // Create separate channels for session invalidation notifications
+        let (session_crossbeam_sender, session_crossbeam_receiver) = channel::unbounded::<qlib_rs::Notification>();
+        let (session_tokio_sender, mut session_tokio_receiver) = mpsc::unbounded_channel::<qlib_rs::Notification>();
 
         // Track registered configs by config_hash
         let registered_configs: Arc<RwLock<HashMap<u64, qlib_rs::NotifyConfig>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        // Spawn task to forward notifications to the WebSocket
+        // Register for session invalidation notifications
+        if let Some(session_id) = ws_session_id {
+            let current_user_field = match handle.get_field_type("CurrentUser").await {
+                Ok(ft) => ft,
+                Err(e) => {
+                    error!("Failed to get CurrentUser field type: {:?}", e);
+                    return;
+                }
+            };
+            
+            // Register notification for CurrentUser being cleared (session invalidation)
+            let session_invalidation_config = qlib_rs::NotifyConfig::EntityId {
+                entity_id: session_id,
+                field_type: current_user_field,
+                trigger_on_change: true,
+                context: vec![],
+            };
+            
+            if let Err(e) = handle.register_notification(session_invalidation_config.clone(), session_crossbeam_sender.clone()).await {
+                error!("Failed to register session invalidation notification: {:?}", e);
+            } else {
+                info!("Registered session invalidation notification for session {:?}", session_id);
+            }
+        }
+
+        // Spawn task to monitor session invalidation
+        let session_disconnect = session.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = session_tokio_receiver.recv().await {
+                // Session invalidation notification (CurrentUser cleared)
+                if let Some(qlib_rs::Value::EntityReference(None)) = notification.current.value {
+                    // CurrentUser was cleared - session invalidated, close connection
+                    info!("Session invalidated (CurrentUser cleared), closing WebSocket connection");
+                    let _ = session_disconnect.close(None).await;
+                    break;
+                }
+            }
+        });
+
+        // Spawn task to bridge session notifications from crossbeam to tokio
+        tokio::spawn(async move {
+            loop {
+                match session_crossbeam_receiver.try_recv() {
+                    Ok(notification) => {
+                        if session_tokio_sender.send(notification).is_err() {
+                            break;
+                        }
+                    }
+                    Err(crossbeam::channel::TryRecvError::Empty) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Spawn task to forward client notifications to the WebSocket
         let mut session_clone = session.clone();
         tokio::spawn(async move {
             while let Some(notification) = tokio_receiver.recv().await {
@@ -178,11 +240,24 @@ pub async fn ws_handler(
             }
         }
 
-        // Unregister all notifications on disconnect
+        // Unregister all client notifications on disconnect
         {
             let map = registered_configs.read().await;
             for (_hash, qlib_config) in map.iter() {
                 let _ = handle.unregister_notification(qlib_config.clone(), crossbeam_sender.clone()).await;
+            }
+        }
+
+        // Unregister session invalidation notification
+        if let Some(session_id) = ws_session_id {
+            if let Ok(current_user_field) = handle.get_field_type("CurrentUser").await {
+                let session_invalidation_config = qlib_rs::NotifyConfig::EntityId {
+                    entity_id: session_id,
+                    field_type: current_user_field,
+                    trigger_on_change: true,
+                    context: vec![],
+                };
+                let _ = handle.unregister_notification(session_invalidation_config, session_crossbeam_sender).await;
             }
         }
 
